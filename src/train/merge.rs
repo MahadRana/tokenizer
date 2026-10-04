@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 pub fn top_pair(counts: &HashMap<(u32, u32), usize>) -> Option<((u32, u32), usize)> {
     if counts.is_empty(){
         return None

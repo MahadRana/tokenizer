@@ -1,7 +1,7 @@
 use std::fs;
 use std::collections::HashMap;
 
-fn read_text(file_path: &str) -> String {
+pub fn read_text(file_path: &str) -> String {
     let content = fs::read_to_string(file_path).expect("Can't find file");
     content
 }
