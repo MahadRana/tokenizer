@@ -8,7 +8,9 @@ Obstacles:
 - map[&key] crashes if the key's missing, .get() gives an Option instead
 
 ## 10/05/2026
+Wrote encode. Until a pair is not found, we look through the code, find the minimum ID pair using the encoder HashMap, replace all the values with that, then reloop. return that Vec\<u32\>
 
 Obstacles: 
-Wrote encode. Until a pair is not found, we look through the code, find the minimum ID pair using the encoder HashMap, replace all the values with that, then reloop. return that Vec\<u32\>
 - contains_key and get both take references not the values themselves
+- when doing a for each loop, the id is already a reference
+- Result Type
