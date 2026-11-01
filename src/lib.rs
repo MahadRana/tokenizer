@@ -1,18 +1,22 @@
 mod codec;
 mod error;
 mod merge;
+mod rank;
 mod train;
 
 pub use error::TokenizerError;
+pub use rank::RankTokenizer;
 pub use train::counter::read_text;
 
 use train::training::{Merges, Vocab};
 
-/// Byte-level BPE tokenizer.
+/// Byte-level BPE tokenizer trained from text.
 ///
-/// The fields are private so the vocab can move from a `HashMap` to a `Vec`
-/// indexed by id without changing callers. Build one with [`Tokenizer::train`].
-/// There is no [`Default`]: `train` is what seeds the 256 single-byte tokens.
+/// Merges are keyed by token-id pairs. OpenAI's cl100k vocab has no merge
+/// list; load that with [`RankTokenizer`]. The fields are private so the vocab
+/// can move from a `HashMap` to a `Vec` indexed by id without changing callers.
+/// Build one with [`Tokenizer::train`]. There is no [`Default`]: `train` is
+/// what seeds the 256 single-byte tokens.
 pub struct Tokenizer {
     merges: Merges,
     vocab: Vocab,

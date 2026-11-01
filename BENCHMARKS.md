@@ -32,3 +32,7 @@ No criterion benches. The timed program is training plus encoding the five-byte 
 ## A1: earlier published baseline
 
 Measured 2026-11-01 on commit `15f5bc2b00ec2fe25cab90ac24788f31f8a2f6ff`, same hyperfine invocation, same class of machine and the same rustc. Wall time **4.206 s ± 0.036 s** (mean 4.206192 s, σ 0.036482 s, min 4.171 s, max 4.273 s). Kept so the original write-up is still here. The 28× figure above uses the remeasure, not this row: it was taken in a different session, a few tens of milliseconds off this machine's rerun.
+
+## A3: cl100k vocab round trip
+
+Not the training command. `decode_encode_piece_round_trips_every_vocab_entry` encodes every mergeable cl100k token and checks `decode_bytes` returns those bytes. Two release runs on 2026-11-01, rustc 1.99.1 (58cf8f9c3 2026-10-13), same machine as the A2 rows: **53.056 ms** and **53.227 ms** for 100,256 tokens. Debug on the test profile was 337 ms. The test fails the run if release exceeds 1 s. These are two clock readings, not a hyperfine mean.
