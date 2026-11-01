@@ -13,24 +13,19 @@ pub fn decode(encoded_text: &[u32], decoder: &HashMap<u32, Vec<u8>>) -> Result<S
 mod tests {
     use super::*;
     use crate::codec::encode::encode;
-    use crate::train::training::training;
-    use std::fs;
+    use crate::train::training::{train, Merges, Vocab};
 
     const CORPUS: &str = "the quick brown fox jumps over the lazy dog. the dog barks, the fox runs. \
         café déjà vu, naïve façade, señor niño, über straße, crème brûlée, café déjà vu. \
         日本語のテキスト、日本語のテキスト。 Привет мир, привет мир! مرحبا مرحبا \
         🙂🙂 🚀🚀 👍🏽👍🏽 👨‍👩‍👧‍👦👨‍👩‍👧‍👦 🇨🇦🇨🇦";
 
-    fn train_on(name: &str, contents: &str) -> (HashMap<(u32, u32), u32>, HashMap<u32, Vec<u8>>) {
-        let path = std::env::temp_dir().join(format!("tokenizer_test_decode_{}", name));
-        fs::write(&path, contents).expect("could not write fixture");
-        let result = training(path.to_str().unwrap());
-        fs::remove_file(&path).ok();
-        result
+    fn train_on(contents: &str) -> (Merges, Vocab) {
+        train(contents, 1000)
     }
 
-    fn assert_round_trips(name: &str, texts: &[&str]) {
-        let (encoder, decoder) = train_on(name, CORPUS);
+    fn assert_round_trips(texts: &[&str]) {
+        let (encoder, decoder) = train_on(CORPUS);
         assert!(!encoder.is_empty());
         for text in texts {
             let tokens = encode(text, &encoder);
@@ -40,41 +35,41 @@ mod tests {
 
     #[test]
     fn decode_of_empty_sequence_is_empty() {
-        let (_, decoder) = train_on("empty", "");
+        let (_, decoder) = train_on("");
         assert_eq!(decode(&[], &decoder).unwrap(), "");
     }
 
     #[test]
     fn decode_of_raw_bytes_is_the_text() {
-        let (_, decoder) = train_on("raw", "");
+        let (_, decoder) = train_on("");
         assert_eq!(decode(&[97, 98, 99], &decoder).unwrap(), "abc");
     }
 
     #[test]
     fn decode_expands_merged_tokens() {
         // "abababab" learns 256 = "ab", 257 = "abab"
-        let (_, decoder) = train_on("merged", "abababab");
+        let (_, decoder) = train_on("abababab");
         assert_eq!(decode(&[257, 256, 99], &decoder).unwrap(), "abababc");
     }
 
     #[test]
     fn decode_joins_multibyte_char_split_across_tokens() {
         // "é" is the two bytes [195, 169]
-        let (_, decoder) = train_on("split", "");
+        let (_, decoder) = train_on("");
         assert_eq!(decode(&[195, 169], &decoder).unwrap(), "é");
     }
 
     #[test]
     fn decode_of_invalid_utf8_is_an_error() {
         // half of "é", and a lone continuation byte
-        let (_, decoder) = train_on("invalid", "");
+        let (_, decoder) = train_on("");
         assert!(decode(&[195], &decoder).is_err());
         assert!(decode(&[97, 169], &decoder).is_err());
     }
 
     #[test]
     fn round_trip_compresses_the_training_text() {
-        let (encoder, decoder) = train_on("corpus", CORPUS);
+        let (encoder, decoder) = train_on(CORPUS);
         let tokens = encode(CORPUS, &encoder);
         assert!(tokens.len() < CORPUS.len());
         assert_eq!(decode(&tokens, &decoder).unwrap(), CORPUS);
@@ -82,7 +77,7 @@ mod tests {
 
     #[test]
     fn round_trip_english() {
-        assert_round_trips("english", &[
+        assert_round_trips(&[
             "the quick brown fox jumps over the lazy dog",
             "Hello, World! It's 3:45pm -- costs $9.99 (approx.)",
             "a",
@@ -92,12 +87,12 @@ mod tests {
 
     #[test]
     fn round_trip_whitespace_and_control_chars() {
-        assert_round_trips("whitespace", &["  leading and trailing  ", "tabs\tand\nnewlines\r\n", "\0"]);
+        assert_round_trips(&["  leading and trailing  ", "tabs\tand\nnewlines\r\n", "\0"]);
     }
 
     #[test]
     fn round_trip_accented_text() {
-        assert_round_trips("accents", &[
+        assert_round_trips(&[
             "café déjà vu",
             "naïve façade, señor niño",
             "Über die Straße, Größe",
@@ -109,7 +104,7 @@ mod tests {
 
     #[test]
     fn round_trip_non_latin_scripts() {
-        assert_round_trips("scripts", &[
+        assert_round_trips(&[
             "日本語のテキスト",
             "中文字符",
             "한국어",
@@ -122,7 +117,7 @@ mod tests {
 
     #[test]
     fn round_trip_emojis() {
-        assert_round_trips("emojis", &[
+        assert_round_trips(&[
             "🙂",
             "🚀🚀🚀",
             // skin tone modifier, ZWJ family, flag
@@ -136,6 +131,6 @@ mod tests {
     #[test]
     fn round_trip_text_unseen_in_training() {
         // none of these characters appear in the corpus
-        assert_round_trips("unseen", &["XYZ 0123456789 @#%^&*", "ΑΒΓ ελληνικά", "🦀🎉"]);
+        assert_round_trips(&["XYZ 0123456789 @#%^&*", "ΑΒΓ ελληνικά", "🦀🎉"]);
     }
 }
