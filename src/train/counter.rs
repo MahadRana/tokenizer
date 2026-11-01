@@ -1,11 +1,16 @@
+use crate::error::TokenizerError;
 use std::fs;
+
+#[cfg(test)]
 use std::collections::HashMap;
 
-pub fn read_text(file_path: &str) -> String {
-    let content = fs::read_to_string(file_path).expect("Can't find file");
-    content
+pub fn read_text(file_path: &str) -> Result<String, TokenizerError> {
+    fs::read_to_string(file_path).map_err(TokenizerError::from)
 }
 
+// Full recount, used by the naive training oracle and the counter tests.
+// Training itself updates pair counts incrementally and does not call this.
+#[cfg(test)]
 pub fn counts(text: &[u32]) -> HashMap<(u32, u32), usize> {
     let mut map = HashMap::new();
     for w in text.windows(2) {
@@ -28,7 +33,7 @@ mod tests {
     #[test]
     fn read_text_returns_file_contents() {
         let path = temp_file("read_text", "hello world");
-        let text = read_text(path.to_str().unwrap());
+        let text = read_text(path.to_str().unwrap()).unwrap();
         fs::remove_file(&path).ok();
         assert_eq!(text, "hello world");
     }
@@ -36,15 +41,20 @@ mod tests {
     #[test]
     fn read_text_handles_empty_file() {
         let path = temp_file("read_text_empty", "");
-        let text = read_text(path.to_str().unwrap());
+        let text = read_text(path.to_str().unwrap()).unwrap();
         fs::remove_file(&path).ok();
         assert_eq!(text, "");
     }
 
     #[test]
-    #[should_panic(expected = "Can't find file")]
-    fn read_text_panics_on_missing_file() {
-        read_text("./definitely/not/a/real/path.txt");
+    fn read_text_errors_on_missing_file() {
+        let err = read_text("./definitely/not/a/real/path.txt").unwrap_err();
+        match err {
+            crate::error::TokenizerError::Io(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected an io error, got {other}"),
+        }
     }
 
     #[test]

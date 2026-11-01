@@ -1,25 +1,29 @@
+#[cfg(test)]
 use std::collections::HashMap;
 
+// The fast trainer picks the max pair with a heap. This scan remains for its
+// unit tests and for the naive training oracle (`train_naive`).
+#[cfg(test)]
 pub fn top_pair(counts: &HashMap<(u32, u32), usize>) -> Option<((u32, u32), usize)> {
-    if counts.is_empty(){
-        return None
+    if counts.is_empty() {
+        return None;
     }
     let mut max_count = 0;
-    let mut max_pair = (0,0);
+    let mut max_pair = (0, 0);
     for (key, value) in counts {
         if (*value > max_count) || ((*value == max_count) && max_pair > *key) {
             max_count = *value;
             max_pair = *key;
-        } 
+        }
     }
     Some((max_pair, max_count))
 }
 
 pub fn merge(seq: &[u32], pair: (u32, u32), new_id: u32) -> Vec<u32> {
     let mut i = 0;
-    let mut v: Vec<u32> = Vec::new(); 
+    let mut v: Vec<u32> = Vec::new();
     while i < seq.len() {
-        if i < seq.len() -1 && pair == (seq[i], seq[i+1]) {
+        if i < seq.len() - 1 && pair == (seq[i], seq[i + 1]) {
             v.push(new_id);
             i += 2;
         } else {
