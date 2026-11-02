@@ -7,12 +7,27 @@
 //! this is a second type. A `rank(&left, &right)` trait would make the
 //! merge-list encoder build byte strings it does not have, and it would
 //! change `Tokenizer::encode`, which the existing tests pin down.
+//!
+//! Full-text [`RankTokenizer::encode`] splits special tokens out first, then
+//! splits each remaining segment with the cl100k regex. Pieces never merge
+//! across a regex boundary.
 
 use crate::error::TokenizerError;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+
+/// `cl100k_base()["pat_str"]`, copied verbatim from tiktoken
+/// `tiktoken_ext/openai_public.py` at commit
+/// `3591ff175d6a80efbe4fcc7f0e219ddd4b8c52f1`
+/// (<https://github.com/openai/tiktoken/blob/3591ff175d6a80efbe4fcc7f0e219ddd4b8c52f1/tiktoken_ext/openai_public.py>).
+///
+/// The same string is what tiktoken 0.14.0 stores on `Encoding._pat_str`.
+/// `\s+(?!\S)` is a negative lookahead, so the `regex` crate rejects the
+/// pattern. fancy-regex is the engine that accepts it, and it is the engine
+/// tiktoken's own Rust core compiles this string with.
+const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
 
 /// Mergeable tokens in `cl100k_base.tiktoken`. Ranks are `0..CL100K_VOCAB_LEN`.
 const CL100K_VOCAB_LEN: usize = 100_256;
@@ -42,12 +57,19 @@ struct Part {
 /// `specials` and are matched as a whole piece. They are never produced by
 /// merging. The encoder is a [`HashMap<Vec<u8>, u32>`] looked up by `&[u8]`
 /// (`Vec<u8>: Borrow<[u8]>`, so a lookup does not allocate a key). The decoder
-/// is a [`Vec<Vec<u8>>`] indexed by rank.
+/// is a [`Vec<Vec<u8>>`] indexed by rank. `pat` is the cl100k regex, compiled
+/// once when the tokenizer is built. [`RankTokenizer::encode`] borrows it.
+/// It is not compiled per call.
+///
+/// `fancy_regex::Regex` is `Send + Sync`. tiktoken still keeps one copy per
+/// thread, because the matcher has internal contention. That split is left
+/// for later; one regex on the struct is enough for a single caller.
 #[derive(Debug)]
 pub struct RankTokenizer {
     encoder: HashMap<Vec<u8>, u32>,
     decoder: Vec<Vec<u8>>,
     specials: HashMap<String, u32>,
+    pat: fancy_regex::Regex,
 }
 
 impl RankTokenizer {
@@ -85,13 +107,51 @@ impl RankTokenizer {
     /// Encode one pre-split piece.
     ///
     /// An exact special token is that one id. Anything else is rank-based BPE
-    /// over the piece's bytes. A special token inside a longer piece is
-    /// ordinary text here; splitting those out is a later step.
+    /// over the piece's bytes. The empty piece is not a token:
+    /// `encode_piece("")` returns an empty vec (tiktoken's piece encoder
+    /// panics on `""`; full-text `encode("")` is also empty, because the
+    /// regex yields no matches). A special token inside a longer piece is
+    /// ordinary text here. [`RankTokenizer::encode`] splits those out before
+    /// it calls this.
     pub fn encode_piece(&self, piece: &str) -> Vec<u32> {
+        if piece.is_empty() {
+            return Vec::new();
+        }
         if let Some(&id) = self.specials.get(piece) {
             return vec![id];
         }
         self.encode_bpe(piece.as_bytes())
+    }
+
+    /// Encode `text`, allowing every registered special token.
+    ///
+    /// Specials are split out first and each becomes one id. Each remaining
+    /// segment is split with [`fancy_regex::Regex::find_iter`] on the regex
+    /// stored in this tokenizer, and each match is passed to
+    /// [`encode_piece`](Self::encode_piece). A search error from fancy-regex
+    /// is returned. This matches tiktoken `encode(text, allowed_special="all")`.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
+        self.encode_splitting(text, None)
+    }
+
+    /// Encode `text`, allowing only the specials in `allowed`.
+    ///
+    /// A registered special that is not in `allowed` is disallowed. If one
+    /// appears anywhere in `text`, this returns
+    /// [`TokenizerError::DisallowedSpecial`] and does not encode the text.
+    /// That is tiktoken's default `disallowed_special="all"`: the disallowed
+    /// set is every registered special minus `allowed`, and a hit is an
+    /// error rather than a silent byte-pair encoding. Strings in `allowed`
+    /// that are not registered specials are ignored.
+    pub fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        allowed: &HashSet<&str>,
+    ) -> Result<Vec<u32>, TokenizerError> {
+        if let Some((_, token, _)) = self.earliest_special(text, |name| !allowed.contains(name)) {
+            return Err(TokenizerError::DisallowedSpecial(token.to_string()));
+        }
+        self.encode_splitting(text, Some(allowed))
     }
 
     /// Concatenate the raw bytes of each id.
@@ -186,7 +246,96 @@ impl RankTokenizer {
             encoder,
             decoder,
             specials: HashMap::new(),
+            // Compiled once per tokenizer, then borrowed by every `encode`.
+            // `?` uses `From<fancy_regex::Error>`.
+            pat: fancy_regex::Regex::new(CL100K_PAT)?,
         })
+    }
+
+    /// Leftmost registered special for which `keep` is true.
+    ///
+    /// The returned `&str` borrows the map entry, not `text`, so the caller
+    /// can copy out the start and the length and then drop the borrow before
+    /// calling another `&self` method that needs the map. Two specials that
+    /// start at the same byte are decided by length, longest first. cl100k's
+    /// five specials are not prefixes of each other, so the choice does not
+    /// come up for this vocab.
+    fn earliest_special<'a>(
+        &'a self,
+        text: &str,
+        mut keep: impl FnMut(&str) -> bool,
+    ) -> Option<(usize, &'a str, u32)> {
+        let mut best: Option<(usize, &'a str, u32)> = None;
+        for (token, &id) in &self.specials {
+            if token.is_empty() || !keep(token) {
+                continue;
+            }
+            let Some(pos) = text.find(token.as_str()) else {
+                continue;
+            };
+            let better = match best {
+                Some((best_pos, best_tok, _)) => {
+                    pos < best_pos || (pos == best_pos && token.len() > best_tok.len())
+                }
+                None => true,
+            };
+            if better {
+                best = Some((pos, token.as_str(), id));
+            }
+        }
+        best
+    }
+
+    fn encode_splitting(
+        &self,
+        text: &str,
+        allowed: Option<&HashSet<&str>>,
+    ) -> Result<Vec<u32>, TokenizerError> {
+        let mut ids = Vec::new();
+        let mut rest = text;
+        loop {
+            // Copy start/len/id out of the map borrow before `push_ordinary`
+            // borrows `self` again. `token` is `&str` into `self.specials`.
+            let next = self
+                .earliest_special(rest, |name| match allowed {
+                    Some(allowed) => allowed.contains(name),
+                    None => true,
+                })
+                .map(|(start, token, id)| (start, token.len(), id));
+            let Some((start, len, id)) = next else {
+                self.push_ordinary(rest, &mut ids)?;
+                break;
+            };
+            self.push_ordinary(&rest[..start], &mut ids)?;
+            ids.push(id);
+            rest = &rest[start + len..];
+        }
+        Ok(ids)
+    }
+
+    /// Regex-split `text` and append one `encode_piece` per match.
+    ///
+    /// `find_iter` yields `Result<Match<'t>, Error>`. `'t` is the lifetime of
+    /// `text`: `Match` stores that `&str`, and `as_str` returns a subslice of
+    /// it, not a borrow of the `Match` temporary. The collected `&str`s are
+    /// valid for the rest of this call and no longer. `collect::<Result<..>>`
+    /// turns the iterator of results into one `Result`, and `?` converts the
+    /// fancy-regex error.
+    fn push_ordinary(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokenizerError> {
+        let pieces = self
+            .pat
+            .find_iter(text)
+            .map(|mat| mat.map(|mat| mat.as_str()))
+            .collect::<Result<Vec<_>, _>>()?;
+        debug_assert_eq!(
+            pieces.concat(),
+            text,
+            "cl100k pattern left a gap in {text:?}"
+        );
+        for piece in pieces {
+            ids.extend(self.encode_piece(piece));
+        }
+        Ok(())
     }
 
     /// Byte-pair encode with no special-token match.
@@ -309,14 +458,61 @@ fn cl100k_specials() -> HashMap<String, u32> {
         .collect()
 }
 
+/// Download `cl100k_base.tiktoken` into `~/.cache` when the tests need it.
+///
+/// The file is not in git. A cached file is used only when its sha256 matches
+/// the hash tiktoken publishes.
+#[cfg(test)]
+pub(crate) fn ensure_cl100k_file() -> std::path::PathBuf {
+    const URL: &str = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken";
+    const HASH: &str = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7";
+    let path = cl100k_cache_path();
+    if path.is_file() && file_sha256(&path) == HASH {
+        return path;
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let tmp = path.with_extension("partial");
+    let status = std::process::Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "-o"])
+        .arg(&tmp)
+        .arg(URL)
+        .status()
+        .unwrap_or_else(|err| panic!("could not run curl ({err}); run scripts/fetch-cl100k.sh"));
+    assert!(status.success(), "curl failed to download cl100k: {status}");
+    assert_eq!(file_sha256(&tmp), HASH, "cl100k download hash mismatch");
+    std::fs::rename(&tmp, &path).unwrap();
+    path
+}
+
+#[cfg(test)]
+fn cl100k_cache_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").expect("HOME is set");
+    std::path::PathBuf::from(home).join(".cache/tokenizer/cl100k_base.tiktoken")
+}
+
+#[cfg(test)]
+fn file_sha256(path: &std::path::Path) -> String {
+    let output = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .unwrap_or_else(|err| panic!("sha256sum failed to start: {err}"));
+    assert!(output.status.success(), "sha256sum failed");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .expect("sha256sum output")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RankTokenizer, STANDARD, cl100k_specials};
+    use super::{CL100K_PAT, RankTokenizer, STANDARD, cl100k_specials};
     use crate::TokenizerError;
     use base64::Engine as _;
     use std::collections::{HashMap, HashSet};
     use std::error::Error;
-    use std::path::PathBuf;
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
@@ -348,9 +544,104 @@ mod tests {
 
     #[test]
     fn empty_piece_encodes_to_nothing() {
+        // Pins encode_piece("") == []. tiktoken's `_encode_single_piece("")`
+        // panics. Full-text encode("") is empty too: the regex yields nothing.
         let tok = vocab(&[(b"a", 0)]);
         assert_eq!(tok.encode_piece(""), Vec::<u32>::new());
+        assert!(tok.encode_piece("").is_empty());
+        assert_eq!(tok.encode("").unwrap(), Vec::<u32>::new());
+        assert_eq!(
+            tok.encode_with_special_tokens("", &HashSet::new()).unwrap(),
+            Vec::<u32>::new()
+        );
         assert_eq!(tok.decode(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn cl100k_pattern_is_stored_once_on_the_tokenizer() {
+        let tok = vocab(&[(b"a", 0)]);
+        assert_eq!(tok.pat.as_str(), CL100K_PAT);
+        assert!(CL100K_PAT.contains(r"\s+(?!\S)"));
+        assert!(tok.pat.as_str().contains(r"(?i:[sdmt]|ll|ve|re)"));
+        // A second encode borrows the same compiled regex. `as_str` is the
+        // pattern the constructor compiled, not a fresh `Regex::new`.
+        assert_eq!(tok.encode("a").unwrap(), vec![0]);
+        assert_eq!(tok.pat.as_str(), CL100K_PAT);
+    }
+
+    #[test]
+    fn regex_split_stops_a_merge_across_the_digit_boundary() {
+        // `\p{N}{1,3}` cuts "12345" into "123" and "45". "234" crosses that
+        // cut. As one piece it is the lowest-rank merge. After the split it
+        // is not a candidate, so encode and encode_piece disagree.
+        // Ranks are dense `0..n`. "234" is the lowest, and it crosses the
+        // regex cut between "123" and "45".
+        let tok = vocab(&[
+            (b"234", 0),
+            (b"23", 1),
+            (b"34", 2),
+            (b"123", 3),
+            (b"45", 4),
+            (b"12", 5),
+            (b"1", 6),
+            (b"2", 7),
+            (b"3", 8),
+            (b"4", 9),
+            (b"5", 10),
+        ]);
+        assert_eq!(tok.encode_piece("12345"), vec![6, 0, 10]);
+        assert_eq!(tok.encode("12345").unwrap(), vec![3, 4]);
+        assert_eq!(tok.decode(&[3, 4]).unwrap(), "12345");
+    }
+
+    #[test]
+    fn disallowed_special_is_an_error_not_bpe() {
+        let mut tok = byte_vocab("hello <|endoftext|> <|fim_prefix|>");
+        tok.specials = cl100k_specials();
+
+        let err = tok
+            .encode_with_special_tokens("hello <|endoftext|>", &HashSet::new())
+            .unwrap_err();
+        assert!(
+            matches!(err, TokenizerError::DisallowedSpecial(ref token) if token == "<|endoftext|>"),
+            "{err}"
+        );
+        // The BPE of the same string is not what the error path returns.
+        let bpe = tok.encode_bpe("hello <|endoftext|>".as_bytes());
+        assert!(bpe.len() > 1, "{bpe:?}");
+        assert!(!bpe.contains(&100_257), "{bpe:?}");
+
+        let only_eot = HashSet::from(["<|endoftext|>"]);
+        let ids = tok
+            .encode_with_special_tokens("hello <|endoftext|>", &only_eot)
+            .unwrap();
+        assert_eq!(*ids.last().unwrap(), 100_257);
+        assert_eq!(tok.decode(&ids).unwrap(), "hello <|endoftext|>");
+        assert_eq!(tok.encode("hello <|endoftext|>").unwrap(), ids);
+
+        // An earlier allowed special does not hide a later disallowed one.
+        let err = tok
+            .encode_with_special_tokens("<|endoftext|> then <|fim_prefix|>", &only_eot)
+            .unwrap_err();
+        assert!(
+            matches!(err, TokenizerError::DisallowedSpecial(ref token) if token == "<|fim_prefix|>"),
+            "{err}"
+        );
+
+        let both = HashSet::from(["<|endoftext|>", "<|fim_prefix|>"]);
+        let ids = tok
+            .encode_with_special_tokens("<|endoftext|><|fim_prefix|>", &both)
+            .unwrap();
+        assert_eq!(ids, vec![100_257, 100_258]);
+        assert_eq!(tok.decode(&ids).unwrap(), "<|endoftext|><|fim_prefix|>");
+
+        // A string that is not a registered special is ordinary text.
+        let allowed_unknown = HashSet::from(["not-a-special"]);
+        let plain = tok
+            .encode_with_special_tokens("hello", &allowed_unknown)
+            .unwrap();
+        assert_eq!(plain, tok.encode("hello").unwrap());
+        assert_eq!(tok.decode(&plain).unwrap(), "hello");
     }
 
     #[test]
@@ -616,54 +907,10 @@ mod tests {
     fn loaded_cl100k() -> &'static RankTokenizer {
         static MODEL: OnceLock<RankTokenizer> = OnceLock::new();
         MODEL.get_or_init(|| {
-            let path = ensure_cl100k_file();
+            let path = super::ensure_cl100k_file();
             RankTokenizer::load_cl100k(path.to_str().expect("cache path is utf-8"))
                 .unwrap_or_else(|err| panic!("load_cl100k({}): {err}", path.display()))
         })
-    }
-
-    fn ensure_cl100k_file() -> PathBuf {
-        const URL: &str =
-            "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken";
-        const HASH: &str = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7";
-        let path = cl100k_cache_path();
-        if path.is_file() && file_sha256(&path) == HASH {
-            return path;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        let tmp = path.with_extension("partial");
-        let status = std::process::Command::new("curl")
-            .args(["-fsSL", "--retry", "3", "-o"])
-            .arg(&tmp)
-            .arg(URL)
-            .status()
-            .unwrap_or_else(|err| {
-                panic!("could not run curl ({err}); run scripts/fetch-cl100k.sh")
-            });
-        assert!(status.success(), "curl failed to download cl100k: {status}");
-        assert_eq!(file_sha256(&tmp), HASH, "cl100k download hash mismatch");
-        std::fs::rename(&tmp, &path).unwrap();
-        path
-    }
-
-    fn cl100k_cache_path() -> PathBuf {
-        let home = std::env::var("HOME").expect("HOME is set");
-        PathBuf::from(home).join(".cache/tokenizer/cl100k_base.tiktoken")
-    }
-
-    fn file_sha256(path: &std::path::Path) -> String {
-        let output = std::process::Command::new("sha256sum")
-            .arg(path)
-            .output()
-            .unwrap_or_else(|err| panic!("sha256sum failed to start: {err}"));
-        assert!(output.status.success(), "sha256sum failed");
-        String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .next()
-            .expect("sha256sum output")
-            .to_string()
     }
 
     #[test]
