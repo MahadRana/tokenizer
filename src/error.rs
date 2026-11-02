@@ -1,13 +1,15 @@
 use std::fmt;
 
-/// Failure from decoding token ids, reading a training file, or parsing a
-/// `.tiktoken` vocab.
+/// Failure from decoding token ids, reading a training file, parsing a
+/// `.tiktoken` vocab, or encoding text.
 ///
-/// `InvalidUtf8` and `Io` wrap the standard-library errors so `?` can convert
+/// `InvalidUtf8`, `Io`, and `Regex` wrap lower-level errors so `?` can convert
 /// them with `From`. A missing token id is not a panic: it is `UnknownToken`.
 /// `Parse` and `Base64` are a bad vocab line. `Base64` keeps the decoder
 /// error as [`source`](std::error::Error::source). There is no `From` for it:
 /// the line number has to be attached at the `map_err` call.
+/// `DisallowedSpecial` is a special token in the text that the caller did not
+/// allow. It is an error, not a byte-pair encoding of that text.
 #[derive(Debug)]
 pub enum TokenizerError {
     UnknownToken(u32),
@@ -26,6 +28,12 @@ pub enum TokenizerError {
         line: usize,
         source: base64::DecodeError,
     },
+    /// `text` contains this registered special token, and it was not in the
+    /// allowed set passed to [`crate::RankTokenizer::encode_with_special_tokens`].
+    DisallowedSpecial(String),
+    /// The pre-tokenizer regex failed to compile, or `find_iter` failed
+    /// while searching (fancy-regex reports a backtrack limit this way).
+    Regex(fancy_regex::Error),
 }
 
 impl fmt::Display for TokenizerError {
@@ -44,6 +52,10 @@ impl fmt::Display for TokenizerError {
             TokenizerError::Base64 { line, source } => {
                 write!(f, "base64 error on line {line}: {source}")
             }
+            TokenizerError::DisallowedSpecial(token) => {
+                write!(f, "disallowed special token {token:?}")
+            }
+            TokenizerError::Regex(err) => write!(f, "regex error: {err}"),
         }
     }
 }
@@ -51,11 +63,20 @@ impl fmt::Display for TokenizerError {
 impl std::error::Error for TokenizerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            TokenizerError::UnknownToken(_) | TokenizerError::Parse { .. } => None,
+            TokenizerError::UnknownToken(_)
+            | TokenizerError::Parse { .. }
+            | TokenizerError::DisallowedSpecial(_) => None,
             TokenizerError::InvalidUtf8(err) => Some(err),
             TokenizerError::Io(err) => Some(err),
             TokenizerError::Base64 { source, .. } => Some(source),
+            TokenizerError::Regex(err) => Some(err),
         }
+    }
+}
+
+impl From<fancy_regex::Error> for TokenizerError {
+    fn from(err: fancy_regex::Error) -> Self {
+        TokenizerError::Regex(err)
     }
 }
 
@@ -136,5 +157,29 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("line 4"), "{rendered}");
         assert!(rendered.contains("base64"), "{rendered}");
+    }
+
+    #[test]
+    fn question_mark_converts_regex_error() {
+        fn compile_bad() -> Result<(), TokenizerError> {
+            // `?` calls `From::from` on `fancy_regex::Error`.
+            let _re = fancy_regex::Regex::new("(")?;
+            Ok(())
+        }
+
+        let err = compile_bad().unwrap_err();
+        assert!(matches!(err, TokenizerError::Regex(_)));
+        assert!(err.source().is_some());
+        assert!(err.to_string().contains("regex"), "{err}");
+    }
+
+    #[test]
+    fn disallowed_special_names_the_token_and_has_no_source() {
+        let err = TokenizerError::DisallowedSpecial("<|endoftext|>".into());
+        assert!(err.source().is_none());
+        assert_eq!(
+            err.to_string(),
+            "disallowed special token \"<|endoftext|>\""
+        );
     }
 }
