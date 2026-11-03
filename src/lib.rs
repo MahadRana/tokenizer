@@ -5,6 +5,8 @@ mod rank;
 mod train;
 
 #[cfg(test)]
+mod diff_fuzz;
+#[cfg(test)]
 mod parity;
 
 pub use error::TokenizerError;

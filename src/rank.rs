@@ -257,9 +257,9 @@ impl RankTokenizer {
     /// The returned `&str` borrows the map entry, not `text`, so the caller
     /// can copy out the start and the length and then drop the borrow before
     /// calling another `&self` method that needs the map. Two specials that
-    /// start at the same byte are decided by length, longest first. cl100k's
-    /// five specials are not prefixes of each other, so the choice does not
-    /// come up for this vocab.
+    /// start at the same byte are decided by length, longest first. That tie
+    /// never fires for cl100k: its five specials are not prefixes of one
+    /// another. See the comment on `str::find` below.
     fn earliest_special<'a>(
         &'a self,
         text: &str,
@@ -270,6 +270,15 @@ impl RankTokenizer {
             if token.is_empty() || !keep(token) {
                 continue;
             }
+            // `str::find` searches each special on its own, then this loop
+            // keeps the leftmost hit and, on the same byte, the longer token.
+            // That is only equivalent to tiktoken while the specials are not
+            // prefixes of one another: two of them never match at the same
+            // index, so the longest-wins tie is dead code for this vocab.
+            // Specials that share a prefix need an alternation (one regex of
+            // the escaped tokens) or a HashMap-style match (try the token map
+            // at the candidate offset). tiktoken's collision order is that
+            // match, not "longest string wins".
             let Some(pos) = text.find(token.as_str()) else {
                 continue;
             };

@@ -1,3 +1,11 @@
 /target
 /text
 book.txt
+
+# cargo-fuzz writes these next to the target. The corpus is generated
+# locally and is not a source file. Crashes worth keeping are copied into
+# a regression test, not left in artifacts/.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

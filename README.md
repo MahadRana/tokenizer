@@ -6,7 +6,7 @@ Byte-level BPE.
 
 ## Tests
 
-`cargo test` does not use the network and does not need the vocab file or `book.txt`.
+`cargo test` runs the proptest suite (`prop_round_trip_bytes`, `prop_matches_tiktoken_rs`) at 10,000 cases. Those tests download the cl100k vocab on first use. `PROPTEST_CASES` overrides the count (for example `PROPTEST_CASES=256 cargo test prop_`). The other tests do not need the vocab file or `book.txt`.
 
 The cl100k file is cached at `~/.cache/tokenizer/cl100k_base.tiktoken`. Download it with:
 
