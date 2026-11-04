@@ -1,0 +1,28 @@
+[package]
+name = "tokenizer-py"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for the tokenizer crate (cl100k_base)"
+license = "MIT"
+publish = false
+
+[lib]
+# Import name. Must match the `#[pymodule]` function.
+name = "mahad_tok"
+# cdylib is the shared library Python loads. No rlib: this crate is not a
+# Rust dependency of anything else.
+crate-type = ["cdylib"]
+
+[dependencies]
+# pyo3 0.30.1 (crates.io, 2026-10-14; docs.rs/pyo3/0.30.1). MSRV 1.85.
+# `abi3-py39` is the stable ABI, so one wheel covers CPython 3.9+.
+# `extension-module` is NOT on by default: it skips linking libpython, which
+# is what a wheel wants and what makes `cargo test`'s harness fail to link.
+# maturin turns that feature on (see pyproject.toml).
+pyo3 = { version = "0.30.1", features = ["abi3-py39"] }
+# rayon 1.12.0 (crates.io, 2026-04-14). Work-stealing pool for encode_batch.
+rayon = "1.12.0"
+tokenizer = { path = ".." }
+
+[features]
+extension-module = ["pyo3/extension-module"]
