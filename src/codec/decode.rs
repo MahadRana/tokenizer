@@ -1,19 +1,26 @@
+use crate::error::TokenizerError;
 use std::collections::HashMap;
 
-pub fn decode(encoded_text: &[u32], decoder: &HashMap<u32, Vec<u8>>) -> Result<String, std::string::FromUtf8Error>  {
-    let mut seq: Vec<u8> = Vec::new();
-    for id in encoded_text {
-        seq.extend_from_slice(&decoder[id]);
+pub fn decode_bytes(ids: &[u32], vocab: &HashMap<u32, Vec<u8>>) -> Result<Vec<u8>, TokenizerError> {
+    let mut bytes = Vec::new();
+    for id in ids {
+        match vocab.get(id) {
+            Some(token) => bytes.extend_from_slice(token),
+            None => return Err(TokenizerError::UnknownToken(*id)),
+        }
     }
-    let text = String::from_utf8(seq)?;
-    Ok(text)
+    Ok(bytes)
+}
+
+pub fn decode(ids: &[u32], vocab: &HashMap<u32, Vec<u8>>) -> Result<String, TokenizerError> {
+    String::from_utf8(decode_bytes(ids, vocab)?).map_err(TokenizerError::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::codec::encode::encode;
-    use crate::train::training::{train, Merges, Vocab};
+    use crate::train::training::{Merges, Vocab, train};
 
     const CORPUS: &str = "the quick brown fox jumps over the lazy dog. the dog barks, the fox runs. \
         café déjà vu, naïve façade, señor niño, über straße, crème brûlée, café déjà vu. \
