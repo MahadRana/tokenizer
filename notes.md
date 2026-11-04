@@ -1,3 +1,6 @@
+## 11/01/2026
+A1: `train` borrows the corpus as `&str` and takes `num_merges`, instead of reading a path and always doing 1000 merges. `Merges` and `Vocab` are type aliases for the two hash maps. The loop is unchanged: count pairs, take `top_pair`, merge, record, and break when every remaining pair occurs once. `main` still does the file read, asks for 1000 merges, and prints when training stops early. Tests call `train` directly, so they no longer need temp files. The missing-file panic stays on `read_text`. `book.txt` (Pride and Prejudice) is gitignored. Release baseline is in `BENCHMARKS.md`: 4.206 s ± 0.036 s, 3.239 bytes/token.
+
 ## 10/03/2026
 Got the training loop written: count pairs, merge top pair, then save pair -> ID rule in Encoder list and update Decoder hashmap with new ID, (ID, \[first's bytes, seconds' bytes\])
 

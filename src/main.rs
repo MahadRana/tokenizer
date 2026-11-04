@@ -9,7 +9,16 @@ fn main() {
         std::process::exit(1);
     }
 
-    let (encoder, _decoder) = train::training::training(&args[1]);
+    let text = train::counter::read_text(&args[1]);
+    let num_merges: u32 = 1000;
+    let (encoder, _decoder) = train::training::train(&text, num_merges);
+    if encoder.len() < num_merges as usize {
+        println!(
+            "stopped early: no pair has count >= 2 (learned {} of {} merges)",
+            encoder.len(),
+            num_merges
+        );
+    }
     let tokens = codec::encode::encode(&args[2], &encoder);
 
     println!("merges learned: {}", encoder.len());
