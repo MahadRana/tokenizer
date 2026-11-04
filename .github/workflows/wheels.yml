@@ -1,0 +1,55 @@
+# Build abi3 wheels. One wheel per OS covers CPython 3.9+ (`abi3-py39`).
+# There is no PyPI publish step and no token: publishing needs an explicit yes.
+name: Wheels
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          manylinux: auto
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          path: dist
+
+  macos:
+    name: macOS wheel
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos
+          path: dist
+
+  windows:
+    name: Windows wheel
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows
+          path: dist

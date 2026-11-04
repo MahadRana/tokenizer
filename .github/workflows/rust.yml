@@ -17,6 +17,8 @@ jobs:
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build --verbose
+      # Workspace default member is the core crate (no PyO3). tokenizer-py is
+      # built by wheels.yml. This job still runs the proptest suite.
     # Includes prop_round_trip_bytes and prop_matches_tiktoken_rs.
     # Those tests default to 10_000 cases. PROPTEST_CASES overrides that
     # (proptest's Config::default reads it; the tests keep the override

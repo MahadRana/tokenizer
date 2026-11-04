@@ -1,3 +1,11 @@
+[workspace]
+# The root package is the core library and the binary. `tokenizer-py` is the
+# Python cdylib. `cargo test` from this directory uses default-members, so the
+# existing suite still runs without linking Python. `cargo clippy --workspace`
+# typechecks both. The fuzz crate stays its own workspace under `fuzz/`.
+members = [".", "tokenizer-py"]
+default-members = ["."]
+
 [package]
 name = "tokenizer"
 version = "0.1.0"
