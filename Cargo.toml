@@ -1,9 +1,10 @@
 [workspace]
 # The root package is the core library and the binary. `tokenizer-py` is the
-# Python cdylib. `cargo test` from this directory uses default-members, so the
-# existing suite still runs without linking Python. `cargo clippy --workspace`
-# typechecks both. The fuzz crate stays its own workspace under `fuzz/`.
-members = [".", "tokenizer-py"]
+# Python cdylib. `qwen-infer` is the Qwen forward pass (candle, hf-hub). It is
+# not a default member, so `cargo test` from this directory still runs the
+# core suite and does not compile candle. `cargo clippy --workspace`
+# typechecks all three. The fuzz crate stays its own workspace under `fuzz/`.
+members = [".", "tokenizer-py", "qwen-infer"]
 default-members = ["."]
 
 [package]
@@ -14,14 +15,22 @@ edition = "2024"
 [dependencies]
 base64 = "0.23"
 fancy-regex = "0.20"
+# Qwen `tokenizer.json` is JSON (vocab, merges, the pre-tokenizer). serde was
+# already a dev-dependency for the cl100k fixtures; the loader needs it in the
+# library. serde 1.0.229 and serde_json 1.0.154 are the versions already pinned
+# in Cargo.lock from A4.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# Qwen's tokenizer.json normalizer is NFC. unicode-normalization 0.1.26
+# (crates.io, 2026-10-16, Unicode 18.0). `encode` applies it only when the
+# loaded tokenizer asks for it. cl100k does not.
+unicode-normalization = "0.1.26"
 
 [dev-dependencies]
 criterion = "0.8.2"
 # proptest 1.12.0 (docs.rs). `prop_oneof!` boxes each arm, `str` is a regex
 # strategy, and `Config::default` reads `PROPTEST_CASES` (default 256).
 proptest = "1.12.0"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
 # tiktoken-rs 0.12.1 (docs.rs). Test oracle only. `cl100k_base()` returns
 # `CoreBPE`; `encode_with_special_tokens(&str) -> Vec<Rank>` with `Rank = u32`.
 # Its cl100k pattern string matches `CL100K_PAT`.

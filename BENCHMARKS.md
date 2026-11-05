@@ -117,3 +117,22 @@ Corpus samples, seconds. Ours then tiktoken. Two samples, so this is a mean of a
 Single-thread on the corpus is **1.32×** tiktoken's time, inside the 1.5× target. The two ours samples differ by about 1.8 s, so the ratio is coarser than the book row. 8 threads is 15.439 / 4.573 = **3.4×** the 1-thread batch. It does not beat 4 threads by a meaningful amount: there are only 4 cores.
 
 A separate pytest on a synthetic list (64 copies of a ~60 KB sentence, minimum of 3 runs) measured `encode_batch(..., num_threads=8)` at 0.124 s, the 1-thread batch at 0.302 s, and a Python loop of `encode` at 0.293 s. A watcher thread recorded 33 GIL acquisitions during a 0.400 s `encode_batch` (`time.sleep(0.01)` in that thread). Those are one pytest run, not the tables above.
+
+## B1: Qwen2.5-0.5B greedy on CPU
+
+Not the training command. `cargo run --release -p qwen-infer -- "The capital of France is"` encodes with `RankTokenizer::load_qwen`, then takes 20 greedy steps. Each step runs the full sequence. There is no KV cache. The clock starts after the weights are loaded and stops after the 20th id. The continuation was ` Paris. It is the largest city in Europe and the third largest city in the world. It is`, the same 20 ids as the transformers float32 eager dump.
+
+Measured 2026-11-05, rustc 1.99.1 (58cf8f9c3 2026-10-13), candle-core 0.11.1, candle-nn 0.11.1, `DType::F32`, `Device::Cpu`. Same machine as the A6 rows.
+
+- Linux 6.12.94+ x86_64, KVM guest
+- 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores.
+- MemTotal 16,387,280 kB
+
+| run | wall time | tokens/sec |
+|---|---|---|
+| 1 | 3.4210 s | 5.8462 |
+| 2 | 3.8330 s | 5.2179 |
+
+Both runs were warm (the weights had already been read). Mean of the two wall times: (3.4210 + 3.8330) / 2 = 3.6270 s, which is 20 / 3.6270 = 5.5142 tokens/sec. Two samples, not a hyperfine mean. The release ignored test that checks the logits also finished its forward plus the 20 steps in 5.97 s, and that number includes loading the mapped weights.
+
+The encoder was not changed for speed in this milestone. The A6 single-thread ratios still stand on this machine: 1.87× tiktoken on the book, 1.32× on the 100 MB corpus. Closing the book gap is a change to the rank scan or the hash, measured again against those two rows.
