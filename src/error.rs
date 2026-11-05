@@ -34,6 +34,9 @@ pub enum TokenizerError {
     /// The pre-tokenizer regex failed to compile, or `find_iter` failed
     /// while searching (fancy-regex reports a backtrack limit this way).
     Regex(fancy_regex::Error),
+    /// `tokenizer.json` is not valid JSON. The line number, when serde has
+    /// one, is inside the source error.
+    Json(serde_json::Error),
 }
 
 impl fmt::Display for TokenizerError {
@@ -56,6 +59,7 @@ impl fmt::Display for TokenizerError {
                 write!(f, "disallowed special token {token:?}")
             }
             TokenizerError::Regex(err) => write!(f, "regex error: {err}"),
+            TokenizerError::Json(err) => write!(f, "json error: {err}"),
         }
     }
 }
@@ -70,7 +74,14 @@ impl std::error::Error for TokenizerError {
             TokenizerError::Io(err) => Some(err),
             TokenizerError::Base64 { source, .. } => Some(source),
             TokenizerError::Regex(err) => Some(err),
+            TokenizerError::Json(err) => Some(err),
         }
+    }
+}
+
+impl From<serde_json::Error> for TokenizerError {
+    fn from(err: serde_json::Error) -> Self {
+        TokenizerError::Json(err)
     }
 }
 

@@ -17,6 +17,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use unicode_normalization::UnicodeNormalization;
 
 /// `cl100k_base()["pat_str"]`, copied verbatim from tiktoken
 /// `tiktoken_ext/openai_public.py` at commit
@@ -67,9 +68,24 @@ struct Part {
 #[derive(Debug)]
 pub struct RankTokenizer {
     encoder: HashMap<Vec<u8>, u32>,
-    decoder: Vec<Vec<u8>>,
+    /// `Some` is the raw bytes of that id. `None` is a hole: the id was never
+    /// in the file. cl100k has no holes (`0..n` is filled). Qwen's decoder is
+    /// sized to the highest id, and a missing slot is [`TokenizerError::UnknownToken`]
+    /// rather than an empty byte string.
+    decoder: Vec<Option<Vec<u8>>>,
     specials: HashMap<String, u32>,
     pat: fancy_regex::Regex,
+    /// Merge priority for Qwen. The key is the merged token's raw bytes and
+    /// the value is the index in `tokenizer.json` `merges` (lower merges
+    /// first). `None` on cl100k, where the encoder value is both the id and
+    /// the rank. Qwen's ids are not in merge order, so the two have to be
+    /// stored apart or `encode_bpe` would merge the lowest id instead of the
+    /// earliest merge.
+    ranks: Option<HashMap<Vec<u8>, u32>>,
+    /// Apply Unicode NFC to each ordinary segment before the regex. Qwen's
+    /// `tokenizer.json` normalizer is NFC. cl100k leaves this off: tiktoken
+    /// does not normalize, and turning it on would change the A4 ids.
+    normalize_nfc: bool,
 }
 
 impl RankTokenizer {
@@ -216,7 +232,7 @@ impl RankTokenizer {
 
         let n = entries.len();
         let mut encoder = HashMap::with_capacity(n);
-        let mut decoder = vec![Vec::new(); n];
+        let mut decoder = vec![None; n];
         for (line_no, bytes, rank) in entries {
             // Unique ranks, each `< n`, are exactly `0..n`. A hole shows up
             // as some rank that does not fit.
@@ -235,10 +251,13 @@ impl RankTokenizer {
             // The base64 decoder owns `bytes`. The map and the vec both need
             // those bytes, so one of them keeps the buffer and the other
             // takes a clone. The file `String` is not stored.
-            decoder[idx] = bytes.clone();
+            decoder[idx] = Some(bytes.clone());
             encoder.insert(bytes, rank);
         }
         debug_assert!(decoder.iter().enumerate().all(|(idx, token)| {
+            let Some(token) = token else {
+                return false;
+            };
             encoder.get(token.as_slice()).copied() == u32::try_from(idx).ok()
         }));
 
@@ -249,6 +268,40 @@ impl RankTokenizer {
             // Compiled once per tokenizer, then borrowed by every `encode`.
             // `?` uses `From<fancy_regex::Error>`.
             pat: fancy_regex::Regex::new(CL100K_PAT)?,
+            ranks: None,
+            normalize_nfc: false,
+        })
+    }
+
+    /// Load a Hugging Face `tokenizer.json` for Qwen2.5 (byte-level BPE).
+    ///
+    /// The file's merges and vocab are unmapped through GPT-2
+    /// `bytes_to_unicode`. Added tokens are matched as literals before the
+    /// pre-tokenizer regex. See [`crate::qwen`] for the format this accepts.
+    pub fn load_qwen(path: &str) -> Result<Self, TokenizerError> {
+        crate::qwen::parse_qwen_file(path)
+    }
+
+    /// Assemble a Qwen tokenizer from parts the JSON loader already checked.
+    ///
+    /// `ranks` is merge priority (lower first), keyed by the merged token's
+    /// bytes. `encoder` is bytes to id, including the single-byte tokens and
+    /// every merge result. `decoder[id]` is that id's bytes. `pattern` is the
+    /// pre-tokenizer regex copied out of the file, compiled once here.
+    pub(crate) fn from_qwen_parts(
+        encoder: HashMap<Vec<u8>, u32>,
+        decoder: Vec<Option<Vec<u8>>>,
+        ranks: HashMap<Vec<u8>, u32>,
+        specials: HashMap<String, u32>,
+        pattern: &str,
+    ) -> Result<Self, TokenizerError> {
+        Ok(Self {
+            encoder,
+            decoder,
+            specials,
+            pat: fancy_regex::Regex::new(pattern)?,
+            ranks: Some(ranks),
+            normalize_nfc: true,
         })
     }
 
@@ -331,20 +384,75 @@ impl RankTokenizer {
     /// turns the iterator of results into one `Result`, and `?` converts the
     /// fancy-regex error.
     fn push_ordinary(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokenizerError> {
-        let pieces = self
-            .pat
-            .find_iter(text)
-            .map(|mat| mat.map(|mat| mat.as_str()))
-            .collect::<Result<Vec<_>, _>>()?;
+        if self.normalize_nfc {
+            // The collected `String` has to live for the pieces borrowed from
+            // it. `text` here is the gap between specials, not the original
+            // input: specials with `normalized: false` were already split out,
+            // which is what Qwen's added tokens ask for.
+            let text = text.nfc().collect::<String>();
+            self.push_pieces(&text, ids)
+        } else {
+            self.push_pieces(text, ids)
+        }
+    }
+
+    fn push_pieces(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokenizerError> {
+        let pieces = if self.ranks.is_some() {
+            // Qwen's Split behavior is `Isolated`: a gap the regex does not
+            // cover is still a piece. cl100k's pattern is written to cover
+            // every byte, and the existing encode only keeps matches.
+            self.pieces_keeping_gaps(text)?
+        } else {
+            self.pat
+                .find_iter(text)
+                .map(|mat| mat.map(|mat| mat.as_str()))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         debug_assert_eq!(
             pieces.concat(),
             text,
-            "cl100k pattern left a gap in {text:?}"
+            "pre-tokenizer left a gap or overlap in {text:?}"
         );
         for piece in pieces {
             ids.extend(self.encode_piece(piece));
         }
         Ok(())
+    }
+
+    /// Regex matches plus the unmatched slices between them.
+    ///
+    /// `Match::start` and `end` are byte offsets into `text`. fancy-regex
+    /// returns them on char boundaries. An empty match would not advance
+    /// `last` and the loop would spin, so that is an error instead.
+    fn pieces_keeping_gaps<'a>(&self, text: &'a str) -> Result<Vec<&'a str>, TokenizerError> {
+        let mut pieces = Vec::new();
+        let mut last = 0usize;
+        for mat in self.pat.find_iter(text) {
+            let mat = mat?;
+            let start = mat.start();
+            let end = mat.end();
+            if start < last || end < start {
+                return Err(TokenizerError::Parse {
+                    line: 0,
+                    message: "pre-tokenizer match went backwards".into(),
+                });
+            }
+            if start > last {
+                pieces.push(&text[last..start]);
+            }
+            if end == start {
+                return Err(TokenizerError::Parse {
+                    line: 0,
+                    message: "pre-tokenizer produced an empty match".into(),
+                });
+            }
+            pieces.push(&text[start..end]);
+            last = end;
+        }
+        if last < text.len() {
+            pieces.push(&text[last..]);
+        }
+        Ok(pieces)
     }
 
     /// Byte-pair encode with no special-token match.
@@ -427,17 +535,26 @@ impl RankTokenizer {
     }
 
     fn rank_of(&self, bytes: &[u8]) -> Option<u32> {
-        self.encoder.get(bytes).copied()
+        match &self.ranks {
+            Some(ranks) => ranks.get(bytes).copied(),
+            None => self.encoder.get(bytes).copied(),
+        }
     }
 
     fn id_of(&self, bytes: &[u8]) -> u32 {
-        self.rank_of(bytes)
+        // The id is always the encoder value. cl100k stores the rank in that
+        // same slot, so `rank_of` and this agree there. Qwen does not: the
+        // rank map is merge order, and calling `rank_of` here would emit the
+        // merge index (0 for the first merge) instead of the vocab id.
+        self.encoder
+            .get(bytes)
+            .copied()
             .unwrap_or_else(|| panic!("vocab is missing token bytes {bytes:?}"))
     }
 
     fn bpe_token(&self, id: u32) -> Option<&[u8]> {
         let idx = usize::try_from(id).ok()?;
-        self.decoder.get(idx).map(Vec::as_slice)
+        self.decoder.get(idx).and_then(|slot| slot.as_deref())
     }
 
     fn special_text(&self, id: u32) -> Option<&str> {
@@ -540,7 +657,7 @@ mod tests {
     fn parses_a_real_file_line() {
         // First line of cl100k_base.tiktoken. "!" is IQ== in standard base64.
         let tok = RankTokenizer::parse("IQ== 0\n").unwrap();
-        assert_eq!(tok.decoder[0], b"!");
+        assert_eq!(tok.decoder[0].as_deref(), Some(b"!".as_slice()));
         assert_eq!(tok.encode_piece("!"), vec![0]);
     }
 

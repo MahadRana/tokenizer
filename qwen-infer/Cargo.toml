@@ -1,0 +1,27 @@
+[package]
+name = "qwen-infer"
+version = "0.1.0"
+edition = "2024"
+description = "CPU forward pass for Qwen2.5-0.5B-Instruct"
+
+[dependencies]
+# Top-level `?` in the binary. candle, hf-hub, and the tokenizer each have
+# their own error type. anyhow 1.x converts all three. The core tokenizer
+# crate does not depend on it.
+anyhow = "1"
+# candle-core and candle-nn 0.11.1 (crates.io, 2026-10-31). The roadmap's
+# table said 0.11.0 (2026-06-26); 0.11.1 is the current release and the one
+# these calls were checked against. No `mkl`, `accelerate`, or `cuda`
+# features: this milestone is the default CPU backend.
+# candle-transformers is not a dependency. Its `models::qwen2` was the
+# reference for layer order and weight names, and the module here is written
+# against candle-nn (Linear, Embedding, RmsNorm, rope, softmax).
+candle-core = "=0.11.1"
+candle-nn = "=0.11.1"
+# hf-hub 1.0.0 (crates.io, 2026-07-10). The 0.4 `Api::model().get()` client
+# is gone. `blocking` turns on `HFClientSync`, which owns a tokio runtime so
+# the binary does not.
+hf-hub = { version = "=1.0.0", features = ["blocking"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokenizer = { path = ".." }
