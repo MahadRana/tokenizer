@@ -2570,6 +2570,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "hf-hub",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "tokenizer",
