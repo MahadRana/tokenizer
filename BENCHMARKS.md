@@ -136,3 +136,26 @@ Measured 2026-11-05, rustc 1.99.1 (58cf8f9c3 2026-10-13), candle-core 0.11.1, ca
 Both runs were warm (the weights had already been read). Mean of the two wall times: (3.4210 + 3.8330) / 2 = 3.6270 s, which is 20 / 3.6270 = 5.5142 tokens/sec. Two samples, not a hyperfine mean. The release ignored test that checks the logits also finished its forward plus the 20 steps in 5.97 s, and that number includes loading the mapped weights.
 
 The encoder was not changed for speed in this milestone. The A6 single-thread ratios still stand on this machine: 1.87× tiktoken on the book, 1.32× on the 100 MB corpus. Closing the book gap is a change to the rank scan or the hash, measured again against those two rows.
+
+## B2: KV cache vs the no-cache loop, 256 new tokens
+
+Not the training command. Both sides generate 256 greedy tokens (`temperature = 0`, no EOS, no stop strings) after the weights are already mapped. The clock does not include that load. Cached time is split into the prompt forward (prefill) and the 256 decode forwards. The no-cache loop is `greedy_tokens`: one full forward of the growing sequence per new token, the B1 loop. Decode tok/s is 256 / decode seconds. The speedup is that rate divided by the no-cache rate. One sample each, not a hyperfine mean. Greedy ids matched on both rows.
+
+Measured 2026-11-06, branch `feat/b2-kv-cache-sampling`, rustc 1.99.1 (58cf8f9c3 2026-10-13), candle-core 0.11.1, candle-nn 0.11.1, `DType::F32`, `Device::Cpu`. This boot's `uname` is Linux 6.12.113+ (the B1 rows were written as 6.12.94+). Same CPU, slightly different MemTotal.
+
+- Linux 6.12.113+ x86_64, KVM guest
+- 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores.
+- MemTotal 16,387,328 kB
+
+| prompt | uncached | cached prefill | cached decode | prefill+decode | speedup |
+|---|---|---|---|---|---|
+| 5 tokens, `"The capital of France is"` | **120.3043 s**, **2.1279 tok/s** | 0.1207 s | **47.4393 s**, **5.3964 tok/s** | 47.5600 s, 5.3827 tok/s | **2.54×** |
+| 516 tokens, the same sentence repeated | **514.4022 s**, **0.4977 tok/s** | 1.3928 s | **55.8705 s**, **4.5820 tok/s** | 57.2633 s, 4.4706 tok/s | **9.21×** |
+
+The 5× bar is the 516-token prompt. The 5-token prompt does not clear it, and the reason is the matmul, not a broken cache. A no-cache step of length L is one batched gemm: the f32 weights are read once and applied to L rows. A cached step is the same read applied to 1 row. Single forwards of the real model, same process, were 0.1861 s at length 1, 0.1502 s at 8, 0.2342 s at 32, 0.3135 s at 64, 0.4842 s at 128, and 0.8238 s at 256. A cached decode step was 0.1875 s, the same as a length-1 forward, so the cache append is not what the 47 s is. From length 32 up the line is about 0.145 s plus 2.5 ms per extra token. Summing that from length 5 through 260 is 121 s, which is the 120.3043 s row. The fixed 0.145 s is streaming roughly 2 GB of weights. A 1 GB copy in this process moved at 24.5 GB/s counting both the read and the write, so a pure read of that working set is already near 0.15 s. Cutting the cached step in half is not available on this guest. The ratio crosses 5× once the prompt is long enough for the per-token term to dominate. At 516 prompt tokens it is 514.4022 / 55.8705 = 9.21×.
+
+`Tensor::cat` copies the prefix every step. Stored K and V are `(1, 2, seq, 64)` f32, 24 layers, both tensors: `seq * 24` KB per step. At seq 256 that step copies 6.0 MB. The sum over 256 steps is `24 KB * 256 * 257 / 2` = 790 MB. At the copy rate above that is under a tenth of a second, against a 47 s decode. The copy is about a tenth of one step when `seq * 24 KB` is ~18 ms, around 9,000 tokens. That is the cost B5 is for. It is not visible at 256.
+
+The default CLI on the 5-token prompt, 20 greedy tokens, EOS ids `[151645, 151643]`, did not hit EOS. Prefill 0.1334 s, decode 3.9059 s, 5.1205 tok/s. The text is the B1 continuation. Twenty tokens is too short for the ratio above to show up: decode is still one weight read per token.
+
+The encoder was not changed. The A6 ratios are untouched.

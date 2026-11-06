@@ -2,7 +2,7 @@
 name = "qwen-infer"
 version = "0.1.0"
 edition = "2024"
-description = "CPU forward pass for Qwen2.5-0.5B-Instruct"
+description = "CPU inference for Qwen2.5-0.5B-Instruct"
 
 [dependencies]
 # Top-level `?` in the binary. candle, hf-hub, and the tokenizer each have
@@ -25,3 +25,9 @@ hf-hub = { version = "=1.0.0", features = ["blocking"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokenizer = { path = ".." }
+# rand 0.10.3 (crates.io, 2026-09-20; docs.rs/rand/0.10.3). Sampling uses
+# `rand::rngs::StdRng` and `SeedableRng::seed_from_u64`. A uniform f32 is
+# `RngExt::random` (the 0.8 `gen` method is gone). candle-core depends on
+# rand 0.9.5; this pin is only the sampler, and 0.10.3 was already in the
+# workspace lockfile via proptest.
+rand = "=0.10.3"
