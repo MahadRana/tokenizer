@@ -2,15 +2,16 @@
 //!
 //! Handlers never call `forward`. They enqueue a [`GenRequest`] and wait on
 //! the per-request `tokio::sync::mpsc` channel. The engine thread is not a
-//! tokio worker: `blocking_send` on that channel would panic if it were,
-//! because tokio's blocking channel methods refuse to run inside the runtime.
+//! tokio worker. `blocking_send` would panic there, and it would also wait
+//! forever if the client stopped reading, so this thread uses `try_send`.
 //!
-//! A dropped receiver is the cancel signal. `Sender::blocking_send` then
-//! returns `Err`, the chunk callback returns [`Control::Stop`], and
-//! [`generate_with`] does not run the next forward. The request queue is a
-//! bounded `std::sync::mpsc` so the engine can `recv_timeout` and notice
-//! shutdown without entering the runtime. `try_send` from a handler does not
-//! block a worker if the queue is full.
+//! A dropped receiver is the cancel signal. The chunk callback returns
+//! [`Control::Stop`], and [`generate_with`] does not run the next forward.
+//! Token sends use `try_send` and sleep, not `blocking_send`: a client that
+//! never reads fills the channel, and a blocking send would pin this thread
+//! across shutdown. The request queue is a bounded `std::sync::mpsc` so the
+//! engine can `recv_timeout` and notice shutdown without entering the runtime.
+//! `try_send` from a handler does not block a worker if the queue is full.
 
 use crate::TokenCodec;
 use qwen_infer::{Control, GenerateParams, StopReason, generate_with};
@@ -81,9 +82,32 @@ pub fn engine_thread(
             break;
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(req) => serve_one(&model, codec.as_ref(), &stats, req),
+            Ok(req) => serve_one(&model, codec.as_ref(), &shutdown, &stats, req),
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// Push one update without parking the engine until the client reads.
+///
+/// `blocking_send` on a full channel waits until the SSE task takes the item.
+/// A client that never reads stops that task at the socket buffer, so the
+/// wait never ends and shutdown's `join` never returns. `try_send` plus a
+/// short sleep lets this thread notice [`AtomicBool`] between attempts.
+/// `false` means the caller should stop the request.
+fn send_update(tx: &mpsc::Sender<GenUpdate>, shutdown: &AtomicBool, mut update: GenUpdate) -> bool {
+    loop {
+        if shutdown.load(Ordering::SeqCst) || tx.is_closed() {
+            return false;
+        }
+        match tx.try_send(update) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(value)) => {
+                update = value;
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 }
@@ -91,6 +115,7 @@ pub fn engine_thread(
 fn serve_one(
     model: &qwen_infer::QwenModel,
     codec: &dyn TokenCodec,
+    shutdown: &AtomicBool,
     stats: &Mutex<EngineStats>,
     req: GenRequest,
 ) {
@@ -117,18 +142,18 @@ fn serve_one(
         &req.params,
         |id| codec.decode_token(id),
         |chunk| {
-            // Capacity is 1. `blocking_send` waits until the SSE task (or the
-            // non-streaming collector) takes the delta. If that receiver has
-            // been dropped, send fails immediately and we do not forward again.
-            if tx.is_closed() {
+            // Checked on empty pieces too, so a shutdown during a withheld
+            // UTF-8 tail still stops before the next forward.
+            if shutdown.load(Ordering::SeqCst) || tx.is_closed() {
                 return Control::Stop;
             }
             if chunk.is_empty() || !stream {
                 return Control::Continue;
             }
-            match tx.blocking_send(GenUpdate::Delta(chunk.to_string())) {
-                Ok(()) => Control::Continue,
-                Err(_) => Control::Stop,
+            if send_update(tx, shutdown, GenUpdate::Delta(chunk.to_string())) {
+                Control::Continue
+            } else {
+                Control::Stop
             }
         },
     );
@@ -150,7 +175,7 @@ fn serve_one(
                     prompt_tokens,
                     completion_tokens: u32::try_from(completion).unwrap_or(u32::MAX),
                 });
-                if tx.blocking_send(done).is_err() {
+                if !send_update(tx, shutdown, done) {
                     finish(stats, true, completion, max_tokens);
                     return;
                 }
@@ -159,7 +184,7 @@ fn serve_one(
         }
         Err(err) => {
             eprintln!("engine error: {err:#}");
-            let _ = tx.blocking_send(GenUpdate::Failed(err.to_string()));
+            let _ = send_update(tx, shutdown, GenUpdate::Failed(err.to_string()));
             finish(stats, false, 0, max_tokens);
         }
     }

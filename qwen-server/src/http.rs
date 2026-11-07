@@ -5,10 +5,12 @@
 //! `JsonRejection` (422 from axum) and is turned into a 400 before the
 //! engine hears about it.
 //!
-//! The SSE body is a [`ReceiverStream`] plus one buffered event. `map` can
-//! only emit one item per token, and the stream has to end with a finish
-//! chunk and then `data: [DONE]`. The finish chunk is returned immediately
-//! and `[DONE]` sits in `pending` until the next poll.
+//! The SSE body is a [`ReceiverStream`] plus a short queue of events. `map`
+//! can only emit one item per token. A finished stream emits the finish
+//! chunk, then (when `stream_options.include_usage` is set) a chunk whose
+//! `choices` are empty and whose `usage` is the token counts, then
+//! `data: [DONE]`. The docs for that shape are the Chat Completions reference,
+//! `stream_options.include_usage`, fetched 2026-11-07.
 
 use crate::chat::{ChatTurn, apply_qwen_chat_template};
 use crate::engine::{self, Done, GenRequest, GenUpdate};
@@ -22,6 +24,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use qwen_infer::{GenerateParams, StopReason};
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -440,6 +443,36 @@ fn finish_reason(reason: StopReason) -> &'static str {
     }
 }
 
+/// `include_usage` off omits the field. On, every ordinary chunk is JSON
+/// `null` and the extra final chunk carries the object. `Option` cannot say
+/// both "omit" and "null".
+enum UsageField {
+    Omit,
+    Null,
+    Present(Usage),
+}
+
+fn usage_field(include_usage: bool) -> UsageField {
+    if include_usage {
+        UsageField::Null
+    } else {
+        UsageField::Omit
+    }
+}
+
+fn omit_usage(field: &UsageField) -> bool {
+    matches!(field, UsageField::Omit)
+}
+
+impl Serialize for UsageField {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            UsageField::Omit | UsageField::Null => serializer.serialize_none(),
+            UsageField::Present(usage) => usage.serialize(serializer),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Chunk<'a> {
     id: &'a str,
@@ -447,8 +480,8 @@ struct Chunk<'a> {
     created: u64,
     model: &'static str,
     choices: Vec<ChunkChoice<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<Usage>,
+    #[serde(skip_serializing_if = "omit_usage")]
+    usage: UsageField,
 }
 
 #[derive(Serialize)]
@@ -496,7 +529,11 @@ impl Stream for CompletionSse {
         }
         if matches!(this.phase, Phase::Role) {
             this.phase = Phase::Events;
-            return Poll::Ready(Some(Ok(event_json(&chunk_role(&this.id, this.created)))));
+            return Poll::Ready(Some(Ok(event_json(&chunk_role(
+                &this.id,
+                this.created,
+                this.include_usage,
+            )))));
         }
         match Pin::new(&mut this.inner).poll_next(cx) {
             Poll::Pending => Poll::Pending,
@@ -505,19 +542,27 @@ impl Stream for CompletionSse {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(GenUpdate::Delta(text))) => Poll::Ready(Some(Ok(event_json(
-                &chunk_content(&this.id, this.created, &text),
+                &chunk_content(&this.id, this.created, &text, this.include_usage),
             )))),
             Poll::Ready(Some(GenUpdate::Done(done))) => {
-                let usage = this
-                    .include_usage
-                    .then(|| usage(done.prompt_tokens, done.completion_tokens));
+                // Ordinary chunks, including this finish chunk, carry `usage:
+                // null` when include_usage is set. The counts ride a following
+                // chunk with an empty `choices` array, then `[DONE]`.
+                if this.include_usage {
+                    this.pending.push_back(event_json(&chunk_usage(
+                        &this.id,
+                        this.created,
+                        done.prompt_tokens,
+                        done.completion_tokens,
+                    )));
+                }
                 this.pending.push_back(Event::default().data("[DONE]"));
                 this.phase = Phase::Done;
                 Poll::Ready(Some(Ok(event_json(&chunk_finish(
                     &this.id,
                     this.created,
                     finish_reason(done.reason),
-                    usage,
+                    this.include_usage,
                 )))))
             }
             Poll::Ready(Some(GenUpdate::Failed(message))) => {
@@ -537,7 +582,7 @@ impl Stream for CompletionSse {
     }
 }
 
-fn chunk_role(id: &str, created: u64) -> Chunk<'_> {
+fn chunk_role(id: &str, created: u64, include_usage: bool) -> Chunk<'_> {
     Chunk {
         id,
         object: "chat.completion.chunk",
@@ -551,11 +596,11 @@ fn chunk_role(id: &str, created: u64) -> Chunk<'_> {
             },
             finish_reason: None,
         }],
-        usage: None,
+        usage: usage_field(include_usage),
     }
 }
 
-fn chunk_content<'a>(id: &'a str, created: u64, text: &'a str) -> Chunk<'a> {
+fn chunk_content<'a>(id: &'a str, created: u64, text: &'a str, include_usage: bool) -> Chunk<'a> {
     Chunk {
         id,
         object: "chat.completion.chunk",
@@ -569,7 +614,7 @@ fn chunk_content<'a>(id: &'a str, created: u64, text: &'a str) -> Chunk<'a> {
             },
             finish_reason: None,
         }],
-        usage: None,
+        usage: usage_field(include_usage),
     }
 }
 
@@ -577,7 +622,7 @@ fn chunk_finish<'a>(
     id: &'a str,
     created: u64,
     reason: &'static str,
-    usage: Option<Usage>,
+    include_usage: bool,
 ) -> Chunk<'a> {
     Chunk {
         id,
@@ -592,7 +637,18 @@ fn chunk_finish<'a>(
             },
             finish_reason: Some(reason),
         }],
-        usage,
+        usage: usage_field(include_usage),
+    }
+}
+
+fn chunk_usage(id: &str, created: u64, prompt_tokens: u32, completion_tokens: u32) -> Chunk<'_> {
+    Chunk {
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: MODEL_ID,
+        choices: Vec::new(),
+        usage: UsageField::Present(usage(prompt_tokens, completion_tokens)),
     }
 }
 

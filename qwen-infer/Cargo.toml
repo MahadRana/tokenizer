@@ -6,9 +6,9 @@ description = "CPU inference for Qwen2.5-0.5B-Instruct"
 
 [dependencies]
 # Top-level `?` in the binary. candle, hf-hub, and the tokenizer each have
-# their own error type. anyhow 1.x converts all three. The core tokenizer
-# crate does not depend on it.
-anyhow = "1"
+# their own error type. anyhow 1.0.104 converts all three. The core tokenizer
+# crate does not depend on it. The pin matches the copy already in Cargo.lock.
+anyhow = "=1.0.104"
 # candle-core and candle-nn 0.11.1 (crates.io, 2026-10-31). The roadmap's
 # table said 0.11.0 (2026-06-26); 0.11.1 is the current release and the one
 # these calls were checked against. No `mkl`, `accelerate`, or `cuda`

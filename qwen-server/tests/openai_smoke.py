@@ -39,6 +39,41 @@ def main() -> None:
     assert objects, "SDK stream produced no chunks"
     assert finish in ("stop", "length"), finish
 
+    # include_usage: ordinary chunks have usage is None (JSON null). The last
+    # yielded chunk has the counts and an empty choices list. [DONE] is not
+    # yielded. Docs: platform.openai.com/docs/api-reference/chat/create
+    # stream_options.include_usage, read 2026-11-07.
+    stream_usage = None
+    stream_finish = None
+    ordinary = 0
+    for chunk in client.chat.completions.create(
+        model=model,
+        messages=messages,
+        stream=True,
+        temperature=0,
+        max_tokens=max_tokens,
+        stream_options={"include_usage": True},
+    ):
+        assert chunk.object == "chat.completion.chunk"
+        if chunk.usage is None:
+            assert chunk.choices, "a null-usage chunk should carry choices"
+            ordinary += 1
+            if chunk.choices[0].finish_reason:
+                stream_finish = chunk.choices[0].finish_reason
+        else:
+            assert list(chunk.choices) == []
+            stream_usage = chunk.usage
+    assert ordinary >= 1
+    assert stream_usage is not None, "SDK did not surface the final usage chunk"
+    assert (
+        stream_usage.total_tokens
+        == stream_usage.prompt_tokens + stream_usage.completion_tokens
+    )
+    if stream_finish == "length":
+        assert stream_usage.completion_tokens == max_tokens
+    else:
+        assert 1 <= stream_usage.completion_tokens <= max_tokens
+
     # The SDK consumes `data: [DONE]` internally and does not yield it.
     # Read the same request once as raw SSE and require that trailer.
     raw_body = {
@@ -90,7 +125,9 @@ def main() -> None:
     print(
         f"OK prompt={usage.prompt_tokens} completion={usage.completion_tokens} "
         f"finish={resp.choices[0].finish_reason} chunks={len(objects)} "
-        f"stream_finish={finish} text={''.join(parts)!r}"
+        f"stream_finish={finish} text={''.join(parts)!r} "
+        f"include_usage_prompt={stream_usage.prompt_tokens} "
+        f"include_usage_completion={stream_usage.completion_tokens}"
     )
 
 

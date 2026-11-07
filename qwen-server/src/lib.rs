@@ -83,7 +83,10 @@ impl Server {
     /// dropped. This method awaits that, then joins the engine from
     /// `spawn_blocking` so the worker that is waiting is not the worker that
     /// has to run the abort.
-    pub async fn shutdown(mut self) {
+    /// The flag is set before the accept loop is aborted, so an engine blocked
+    /// on a full token channel observes it and leaves. The returned stats are
+    /// whatever the engine wrote before that thread exited.
+    pub async fn shutdown(mut self) -> EngineStats {
         self.signal_stop();
         if let Some(task) = self.task.take() {
             task.abort();
@@ -92,6 +95,7 @@ impl Server {
         if let Some(handle) = self.engine.take() {
             let _ = tokio::task::spawn_blocking(move || handle.join()).await;
         }
+        self.stats()
     }
 
     fn signal_stop(&mut self) {

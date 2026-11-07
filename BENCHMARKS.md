@@ -162,7 +162,7 @@ The encoder was not changed. The A6 ratios are untouched.
 
 ## B3: server TTFT and decode, chat template, 20-token cap
 
-Not the training command. `qwen-server` in release, one request at a time, temperature 0, after a 1-token warmup so the f32 weights are already faulted in. The client is the OpenAI Python SDK 3.46.0 pointed at `http://127.0.0.1:8080/v1`. TTFT is the client's clock from `create(stream=True)` to the first chunk whose delta has `content`. The engine lines are the prefill forward and the decode interval printed by the engine thread. One sample each, not a hyperfine mean.
+Not the training command, and not a sustained-throughput run. `qwen-server` in release, one request at a time, temperature 0, after a 1-token warmup so the f32 weights are already faulted in. The client is the OpenAI Python SDK 3.46.0 pointed at `http://127.0.0.1:8080/v1`. TTFT is the client's clock from `create(stream=True)` to the first chunk whose delta has `content`. The engine lines are the prefill forward and the decode interval printed by the engine thread. One warmed short request each, not a hyperfine mean and not a load test.
 
 Measured 2026-11-07, branch `feat/b3-openai-api`, rustc 1.99.1 (58cf8f9c3 2026-10-13), candle-core 0.11.1, candle-nn 0.11.1, axum 0.8.9, tokio 1.54.1, `DType::F32`, `Device::Cpu`. Same machine as the B2 rows.
 

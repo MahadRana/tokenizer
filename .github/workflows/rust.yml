@@ -15,6 +15,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: cargo-core-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-core-${{ runner.os }}-
     - name: Build
       run: cargo build --verbose
       # Workspace default member is the core crate (no PyO3). tokenizer-py is
@@ -26,3 +36,31 @@ jobs:
     # needs nightly and a long local run (`cargo +nightly fuzz run`).
     - name: Run tests
       run: cargo test --verbose
+
+  # qwen-infer and qwen-server are not default members, so the job above
+  # does not compile candle. This job runs their non-ignored tests only.
+  # Weight downloads (`--ignored`) stay local: they are CPU forwards of the
+  # 0.5B checkpoint, not something CI should fetch. No GPU.
+  infer:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    # The chat-template unit test shells out to jinja2. The SDK test imports
+    # openai and talks to the in-process tiny model, not to api.openai.com.
+    - name: Python test dependencies
+      run: pip install 'jinja2==3.1.2' 'openai==3.46.0'
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: cargo-infer-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-infer-${{ runner.os }}-
+    - name: Test qwen-infer and qwen-server
+      run: cargo test -p qwen-infer && cargo test -p qwen-server

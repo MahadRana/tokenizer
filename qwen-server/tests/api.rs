@@ -172,11 +172,132 @@ async fn stream_ends_with_done_and_chunk_objects() {
         if chunk["choices"][0]["finish_reason"] == "length" {
             saw_length = true;
         }
+        assert!(
+            chunk.get("usage").is_none(),
+            "usage is omitted unless include_usage is set: {chunk}"
+        );
     }
     assert!(saw_role);
     assert!(saw_length);
     assert_eq!(contents.chars().count(), 3, "{contents}");
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn include_usage_nulls_every_chunk_then_sends_an_empty_choices_chunk() {
+    let server = spawn(Arc::new(CharCodec), Vec::new()).await;
+    let client = reqwest::Client::new();
+    let prompt = apply_qwen_chat_template(&[ChatTurn {
+        role: "user".into(),
+        content: "Say hi".into(),
+    }])
+    .unwrap();
+    let expected_prompt = prompt.chars().count() as u64;
+
+    let off = sse_values(
+        &client,
+        &server,
+        &chat_body(json!({"stream": true, "max_tokens": 4})),
+    )
+    .await;
+    assert_eq!(off.last().and_then(|v| v.as_str()), Some("[DONE]"));
+    for value in &off[..off.len() - 1] {
+        assert!(value.get("usage").is_none(), "{value}");
+        assert!(!value["choices"].as_array().unwrap().is_empty(), "{value}");
+    }
+
+    let on = sse_values(
+        &client,
+        &server,
+        &chat_body(json!({
+            "stream": true,
+            "max_tokens": 4,
+            "stream_options": {"include_usage": true}
+        })),
+    )
+    .await;
+    assert_eq!(on.last().and_then(|v| v.as_str()), Some("[DONE]"));
+    let json_chunks: Vec<&Value> = on[..on.len() - 1].iter().collect();
+    let (usage_chunk, normals) = json_chunks.split_last().unwrap();
+    assert!(
+        usage_chunk["choices"].as_array().unwrap().is_empty(),
+        "{usage_chunk}"
+    );
+    assert_eq!(usage_chunk["usage"]["prompt_tokens"], expected_prompt);
+    assert_eq!(usage_chunk["usage"]["completion_tokens"], 4);
+    assert_eq!(usage_chunk["usage"]["total_tokens"], expected_prompt + 4);
+    assert!(!normals.is_empty());
+    for value in normals {
+        assert!(value["usage"].is_null(), "{value}");
+        assert!(!value["choices"].as_array().unwrap().is_empty(), "{value}");
+    }
+    server.shutdown().await;
+}
+
+async fn sse_values(client: &reqwest::Client, server: &Server, body: &Value) -> Vec<Value> {
+    let response = client
+        .post(url(server, "/v1/chat/completions"))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{body}");
+    let raw = response.text().await.unwrap();
+    raw.lines()
+        .filter(|line| line.starts_with("data:"))
+        .map(|line| {
+            let payload = line.trim_start_matches("data:").trim();
+            if payload == "[DONE]" {
+                Value::String("[DONE]".to_string())
+            } else {
+                serde_json::from_str(payload).unwrap()
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn shutdown_cancels_a_stream_the_client_never_reads() {
+    let server = spawn(Arc::new(CharCodec), Vec::new()).await;
+    let addr = server.addr();
+    let body = chat_body(json!({"stream": true, "max_tokens": 1500})).to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+        body.len()
+    );
+    let tcp = std::net::TcpStream::connect(addr).unwrap();
+    let sock = socket2::Socket::from(tcp);
+    // The kernel raises this, but it stays far below 1500 SSE events.
+    sock.set_recv_buffer_size(1024).unwrap();
+    let tcp: std::net::TcpStream = sock.into();
+    tcp.set_nonblocking(true).unwrap();
+    let mut stream = tokio::net::TcpStream::from_std(tcp).unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 256];
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+    // Stop reading. The engine fills the token channel and would block forever
+    // on `blocking_send`. Shutdown has to notice the flag and return.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = std::time::Instant::now();
+    let stats = tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+        .await
+        .expect("shutdown waited on the unread stream");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "shutdown took {elapsed:?}"
+    );
+    assert!(stats.last_finished, "{stats:?}");
+    assert!(
+        stats.last_completion_tokens < 1500,
+        "generation ran to max_tokens instead of stopping: {stats:?}"
+    );
+    eprintln!(
+        "shutdown of an unread stream took {elapsed:?} after {} completion tokens (max 1500, cancelled {})",
+        stats.last_completion_tokens, stats.last_cancelled
+    );
+    drop(stream);
 }
 
 #[tokio::test]
