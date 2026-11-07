@@ -2651,6 +2651,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "socket2",
  "tokenizer",
  "tokio",
  "tokio-stream",
