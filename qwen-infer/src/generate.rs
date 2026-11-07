@@ -24,6 +24,21 @@ pub enum StopReason {
     /// A stop string occurred in the decoded text. The string itself is not
     /// in [`Generated::text`] or in any streamed chunk.
     StopString,
+    /// The caller returned [`Control::Stop`] from the chunk callback.
+    ///
+    /// The id already sampled stays in [`Generated::tokens`]. No further
+    /// forward is run. This is how a dropped HTTP stream stops the engine:
+    /// the send fails, the callback returns [`Control::Stop`].
+    Cancelled,
+}
+
+/// What the chunk callback tells [`generate_with`] to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// Sample another token, until a stop condition.
+    Continue,
+    /// Stop before the next forward. The token just sampled is kept.
+    Stop,
 }
 
 /// Sampling and stop settings for one [`generate`] call.
@@ -71,6 +86,13 @@ pub struct Generated {
     /// [`Self::text`]. A stop string never appears in a piece.
     pub chunks: Vec<String>,
     pub reason: StopReason,
+    /// Ids the model sampled.
+    ///
+    /// This counts an EOS id, which is not stored in [`Self::tokens`] and is
+    /// not decoded. A stop-string token is already in [`Self::tokens`], so it
+    /// is not added twice. [`StopReason::Cancelled`] counts only the ids
+    /// sampled before the callback returned [`Control::Stop`].
+    pub completion_tokens: usize,
     /// The prompt forward, before the first sampled id.
     pub prefill: Duration,
     /// The decode forwards, after prefill. Sampling itself is in this
@@ -79,25 +101,84 @@ pub struct Generated {
 }
 
 /// Prefill `prompt` at position 0, then sample up to `params.max_tokens` new
-/// ids. Each new id is one cached forward at `cache.seq_len()`.
+/// ids. Each new id except the last one is one cached forward at
+/// `cache.seq_len()`.
+///
+/// The forward that used to run after the `max_tokens`-th sample is skipped.
+/// Its logits would only feed a token the loop is not allowed to draw.
 ///
 /// `token_bytes` is `Tokenizer::decode_bytes` (or `RankTokenizer::decode_bytes`)
 /// on a single id. The streaming decoder concatenates those bytes.
+///
+/// The chunk callback is [`Control::Continue`]. Use [`generate_with`] to stop
+/// early when a client goes away.
 pub fn generate(
     model: &QwenModel,
     prompt: &[u32],
     params: &GenerateParams,
+    token_bytes: impl FnMut(u32) -> Result<Vec<u8>, TokenizerError>,
+) -> anyhow::Result<Generated> {
+    generate_with(model, prompt, params, token_bytes, |_| Control::Continue)
+}
+
+/// [`generate`], plus a callback for each piece of text that is safe to show.
+///
+/// An empty piece is still delivered. That is a split UTF-8 character or a
+/// stop-string prefix being held back, and it is how a caller notices a
+/// disconnect without waiting for the next visible character.
+///
+/// [`Control::Stop`] ends the loop before the next `forward`. The forward
+/// that produced the logits for the token just sampled has already run; the
+/// forward of that token itself has not, and it does not.
+pub fn generate_with(
+    model: &QwenModel,
+    prompt: &[u32],
+    params: &GenerateParams,
+    token_bytes: impl FnMut(u32) -> Result<Vec<u8>, TokenizerError>,
+    on_chunk: impl FnMut(&str) -> Control,
+) -> anyhow::Result<Generated> {
+    let mut step = QwenStep {
+        model,
+        cache: KvCache::new(model.num_layers()),
+    };
+    generate_loop(&mut step, prompt, params, token_bytes, on_chunk)
+}
+
+/// One cached forward. The real model appends to its [`KvCache`]. A test
+/// double only counts the call, which is how the unused tail forward is
+/// checked without timing it.
+trait StepModel {
+    fn forward_tokens(&mut self, ids: &[u32]) -> anyhow::Result<Vec<f32>>;
+}
+
+struct QwenStep<'a> {
+    model: &'a QwenModel,
+    cache: KvCache,
+}
+
+impl StepModel for QwenStep<'_> {
+    fn forward_tokens(&mut self, ids: &[u32]) -> anyhow::Result<Vec<f32>> {
+        let pos = self.cache.seq_len();
+        let logits = self.model.forward(ids, pos, &mut self.cache)?;
+        Ok(logits.to_vec1::<f32>()?)
+    }
+}
+
+fn generate_loop(
+    step: &mut impl StepModel,
+    prompt: &[u32],
+    params: &GenerateParams,
     mut token_bytes: impl FnMut(u32) -> Result<Vec<u8>, TokenizerError>,
+    mut on_chunk: impl FnMut(&str) -> Control,
 ) -> anyhow::Result<Generated> {
     validate(params)?;
     if prompt.is_empty() {
         anyhow::bail!("prompt encoded to no tokens");
     }
 
-    let mut cache = KvCache::new(model.num_layers());
     let mut rng = StdRng::seed_from_u64(params.seed);
     let prefill_started = std::time::Instant::now();
-    let mut logits = model.forward(prompt, 0, &mut cache)?;
+    let mut logits = step.forward_tokens(prompt)?;
     let prefill = prefill_started.elapsed();
 
     let mut decoder = StreamDecoder::new();
@@ -107,49 +188,88 @@ pub fn generate(
     let mut text = String::new();
     let decode_started = std::time::Instant::now();
     let mut reason = StopReason::MaxTokens;
+    let mut produced = 0usize;
 
-    for _ in 0..params.max_tokens {
-        let values = logits.to_vec1::<f32>()?;
-        let id = sample::sample_token(&values, params.temperature, params.top_p, &mut rng)?;
-        if params.eos.contains(&id) {
-            reason = StopReason::Eos;
-            break;
-        }
-        let bytes = token_bytes(id)?;
-        let piece = decoder.push(&bytes);
-        match held.push(&piece, &params.stop) {
-            HoldOut::Stop(chunk) => {
-                emit(&mut chunks, &mut text, &chunk);
-                tokens.push(id);
-                reason = StopReason::StopString;
-                break;
+    if params.max_tokens > 0 {
+        if on_chunk("") == Control::Stop {
+            reason = StopReason::Cancelled;
+        } else {
+            loop {
+                if produced >= params.max_tokens {
+                    reason = StopReason::MaxTokens;
+                    break;
+                }
+                let id = sample::sample_token(&logits, params.temperature, params.top_p, &mut rng)?;
+                if params.eos.contains(&id) {
+                    produced += 1;
+                    reason = StopReason::Eos;
+                    break;
+                }
+                let bytes = token_bytes(id)?;
+                let piece = decoder.push(&bytes);
+                let control = match held.push(&piece, &params.stop) {
+                    HoldOut::Stop(chunk) => {
+                        tokens.push(id);
+                        produced += 1;
+                        let control = observe(&mut on_chunk, &chunk, &mut chunks, &mut text);
+                        reason = if control == Control::Stop {
+                            StopReason::Cancelled
+                        } else {
+                            StopReason::StopString
+                        };
+                        break;
+                    }
+                    HoldOut::Continue(chunk) => {
+                        tokens.push(id);
+                        produced += 1;
+                        observe(&mut on_chunk, &chunk, &mut chunks, &mut text)
+                    }
+                };
+                if control == Control::Stop {
+                    reason = StopReason::Cancelled;
+                    break;
+                }
+                // The sample that filled `max_tokens` has nowhere to go.
+                // Forwarding it would build logits for a token we must not
+                // draw. EOS and stop-string breaks above take the same exit.
+                if produced >= params.max_tokens {
+                    reason = StopReason::MaxTokens;
+                    break;
+                }
+                logits = step.forward_tokens(&[id])?;
             }
-            HoldOut::Continue(chunk) => {
-                emit(&mut chunks, &mut text, &chunk);
-                tokens.push(id);
-            }
         }
-        let pos = cache.seq_len();
-        logits = model.forward(&[id], pos, &mut cache)?;
     }
 
-    if reason != StopReason::StopString {
+    if matches!(reason, StopReason::MaxTokens | StopReason::Eos) {
         // The decoder may still be holding a split character. `finish` is the
         // end of the stream, so a replacement here is not a mid-stream guess.
+        // A cancel leaves that tail alone: the client is already gone.
         let flushed = decoder.finish();
         if !flushed.is_empty() {
             match held.push(&flushed, &params.stop) {
                 HoldOut::Stop(chunk) => {
-                    emit(&mut chunks, &mut text, &chunk);
-                    reason = StopReason::StopString;
+                    let control = observe(&mut on_chunk, &chunk, &mut chunks, &mut text);
+                    reason = if control == Control::Stop {
+                        StopReason::Cancelled
+                    } else {
+                        StopReason::StopString
+                    };
                 }
                 HoldOut::Continue(chunk) => {
-                    emit(&mut chunks, &mut text, &chunk);
-                    emit(&mut chunks, &mut text, &held.finish());
+                    let first = observe(&mut on_chunk, &chunk, &mut chunks, &mut text);
+                    let tail = held.finish();
+                    let second = observe(&mut on_chunk, &tail, &mut chunks, &mut text);
+                    if first == Control::Stop || second == Control::Stop {
+                        reason = StopReason::Cancelled;
+                    }
                 }
             }
         } else {
-            emit(&mut chunks, &mut text, &held.finish());
+            let tail = held.finish();
+            if observe(&mut on_chunk, &tail, &mut chunks, &mut text) == Control::Stop {
+                reason = StopReason::Cancelled;
+            }
         }
     }
     let decode = decode_started.elapsed();
@@ -159,9 +279,23 @@ pub fn generate(
         text,
         chunks,
         reason,
+        completion_tokens: produced,
         prefill,
         decode,
     })
+}
+
+fn observe(
+    on_chunk: &mut impl FnMut(&str) -> Control,
+    piece: &str,
+    chunks: &mut Vec<String>,
+    text: &mut String,
+) -> Control {
+    if !piece.is_empty() {
+        chunks.push(piece.to_string());
+        text.push_str(piece);
+    }
+    on_chunk(piece)
 }
 
 fn validate(params: &GenerateParams) -> anyhow::Result<()> {
@@ -181,14 +315,6 @@ fn validate(params: &GenerateParams) -> anyhow::Result<()> {
         anyhow::bail!("stop strings must be non-empty");
     }
     Ok(())
-}
-
-fn emit(chunks: &mut Vec<String>, text: &mut String, piece: &str) {
-    if piece.is_empty() {
-        return;
-    }
-    chunks.push(piece.to_string());
-    text.push_str(piece);
 }
 
 /// Decoded text, plus how much of it has already been handed to the caller.
@@ -289,6 +415,7 @@ mod tests {
         let out = generate(&model, &[1, 2, 3], &params, scripted(b"abcdefgh")).unwrap();
         assert_eq!(out.reason, StopReason::MaxTokens);
         assert_eq!(out.tokens.len(), 3);
+        assert_eq!(out.completion_tokens, 3);
         assert_eq!(out.text, "abc");
         assert_eq!(out.chunks.concat(), out.text);
         let uncached = crate::greedy_tokens(&model, &[1, 2, 3], 3).unwrap();
@@ -425,5 +552,90 @@ mod tests {
             HoldOut::Continue(text) => panic!("missed the stop, emitted {text:?}"),
         }
         assert_eq!(held.full[..held.emitted], *"ab");
+    }
+
+    struct CountingStep {
+        forwards: usize,
+        lens: Vec<usize>,
+    }
+
+    impl super::StepModel for CountingStep {
+        fn forward_tokens(&mut self, ids: &[u32]) -> anyhow::Result<Vec<f32>> {
+            self.forwards += 1;
+            self.lens.push(ids.len());
+            // Id 1 wins the argmax. Temperature 0 never draws.
+            let mut logits = vec![0.0; 4];
+            logits[1] = 2.5;
+            Ok(logits)
+        }
+    }
+
+    fn letters(id: u32) -> Result<Vec<u8>, TokenizerError> {
+        let _ = id;
+        Ok(vec![b'Q'])
+    }
+
+    #[test]
+    fn max_tokens_does_not_forward_the_unused_tail() {
+        let mut step = CountingStep {
+            forwards: 0,
+            lens: Vec::new(),
+        };
+        let params = GenerateParams::greedy(5);
+        let out = super::generate_loop(&mut step, &[4, 5, 6], &params, letters, |_| {
+            Control::Continue
+        })
+        .unwrap();
+        assert_eq!(out.reason, StopReason::MaxTokens);
+        assert_eq!(out.tokens, vec![1, 1, 1, 1, 1]);
+        assert_eq!(out.completion_tokens, 5);
+        // Prefill plus one forward per sampled id except the last. The old
+        // loop forwarded that last id and threw the logits away.
+        assert_eq!(step.forwards, 5);
+        assert_eq!(step.lens, vec![3, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn eos_is_counted_and_not_forwarded() {
+        let mut step = CountingStep {
+            forwards: 0,
+            lens: Vec::new(),
+        };
+        let mut params = GenerateParams::greedy(5);
+        params.eos = vec![1];
+        let out =
+            super::generate_loop(&mut step, &[4], &params, letters, |_| Control::Continue).unwrap();
+        assert_eq!(out.reason, StopReason::Eos);
+        assert!(out.tokens.is_empty());
+        assert_eq!(out.completion_tokens, 1);
+        assert_eq!(step.forwards, 1);
+        assert_eq!(step.lens, vec![1]);
+    }
+
+    #[test]
+    fn callback_stop_skips_the_next_forward() {
+        let mut step = CountingStep {
+            forwards: 0,
+            lens: Vec::new(),
+        };
+        let params = GenerateParams::greedy(50);
+        let mut visible = 0;
+        let out = super::generate_loop(&mut step, &[4, 5], &params, letters, |chunk| {
+            if chunk.is_empty() {
+                return Control::Continue;
+            }
+            visible += 1;
+            if visible == 1 {
+                Control::Stop
+            } else {
+                Control::Continue
+            }
+        })
+        .unwrap();
+        assert_eq!(out.reason, StopReason::Cancelled);
+        assert_eq!(out.tokens, vec![1]);
+        assert_eq!(out.completion_tokens, 1);
+        assert_eq!(out.text, "Q");
+        assert_eq!(step.forwards, 1, "cancel must not forward the sampled id");
     }
 }

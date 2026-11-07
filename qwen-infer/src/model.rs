@@ -433,6 +433,14 @@ impl QwenModel {
         self.layers.len()
     }
 
+    /// `max_position_embeddings` from `config.json`.
+    ///
+    /// A request whose prompt plus `max_tokens` would walk past this is
+    /// rejected before the engine thread sees it.
+    pub fn max_position_embeddings(&self) -> usize {
+        self.cfg.max_position_embeddings
+    }
+
     /// Hidden states after the final RMSNorm, shape `(1, seq, hidden)`.
     ///
     /// No cache. The tokens are the whole context, and position `pos` is only
@@ -593,8 +601,24 @@ impl QwenModel {
 
 /// Two-layer model with a fixed pattern in every tensor. Zeros hide a wrong
 /// mask, because V is zero and the attention output is zero either way.
+///
+/// `max_position_embeddings` is 32 here. [`tiny_model`] is the same net with
+/// a longer table, for a chat-templated prompt in the server tests.
 #[cfg(test)]
 pub(crate) fn patterned_model(sliding: bool) -> QwenModel {
+    build_tiny(sliding, 32)
+}
+
+/// Patterned two-layer net for protocol tests. Not a Qwen checkpoint.
+///
+/// Hidden 16, vocab 32, `max_position_embeddings` 2048. Token ids have to
+/// be below 32. The server tests encode a chat string into that range.
+#[doc(hidden)]
+pub fn tiny_model(sliding: bool) -> QwenModel {
+    build_tiny(sliding, 2048)
+}
+
+fn build_tiny(sliding: bool, max_position_embeddings: usize) -> QwenModel {
     let cfg = Config {
         vocab_size: 32,
         hidden_size: 16,
@@ -602,7 +626,7 @@ pub(crate) fn patterned_model(sliding: bool) -> QwenModel {
         num_hidden_layers: 2,
         num_attention_heads: 4,
         num_key_value_heads: 2,
-        max_position_embeddings: 32,
+        max_position_embeddings,
         sliding_window: 3,
         max_window_layers: 0,
         tie_word_embeddings: true,
