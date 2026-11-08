@@ -159,3 +159,27 @@ The 5× bar is the 516-token prompt. The 5-token prompt does not clear it, and t
 The default CLI on the 5-token prompt, 20 greedy tokens, EOS ids `[151645, 151643]`, did not hit EOS. Prefill 0.1334 s, decode 3.9059 s, 5.1205 tok/s. The text is the B1 continuation. Twenty tokens is too short for the ratio above to show up: decode is still one weight read per token.
 
 The encoder was not changed. The A6 ratios are untouched.
+
+## B3: server TTFT and decode, chat template, 20-token cap
+
+Not the training command, and not a sustained-throughput run. `qwen-server` in release, one request at a time, temperature 0, after a 1-token warmup so the f32 weights are already faulted in. The client is the OpenAI Python SDK 3.46.0 pointed at `http://127.0.0.1:8080/v1`. TTFT is the client's clock from `create(stream=True)` to the first chunk whose delta has `content`. The engine lines are the prefill forward and the decode interval printed by the engine thread. One warmed short request each, not a hyperfine mean and not a load test.
+
+Measured 2026-11-07, branch `feat/b3-openai-api`, rustc 1.99.1 (58cf8f9c3 2026-10-13), candle-core 0.11.1, candle-nn 0.11.1, axum 0.8.9, tokio 1.54.1, `DType::F32`, `Device::Cpu`. Same machine as the B2 rows.
+
+- Linux 6.12.113+ x86_64, KVM guest
+- 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores.
+- MemTotal 16,387,328 kB
+
+The prompt is a chat turn, not the raw string from B1. The template adds the default system line and `<|im_start|>assistant\n`. `"The capital of France is"` is **34** prompt tokens. `"Say hi"` is **31**.
+
+| call | prompt tokens | completion tokens | finish | prefill | decode | client TTFT | text |
+|---|---|---|---|---|---|---|---|
+| warmup, `max_tokens` 1 | 34 | 1 | length | 0.2104 s | **0.0002 s** | | `The` |
+| stream, stops on EOS | 34 | 8 | stop | 0.2075 s | **1.2975 s** | **0.2100 s** | `The capital of France is Paris.` |
+| non-stream, same request | 34 | 8 | stop | 0.2118 s | 1.3037 s | | same text, `total_tokens` 42 |
+
+8 / 1.2975 = **6.17 tok/s** over the decode interval. The last of those 8 is the EOS id (`<|im_end|>`, not decoded). The other 7 are the text. Client TTFT is the prefill: the first token is sampled from the prompt logits, and the loop does not run a forward after a token it will not continue from. The warmup's decode of 0.0002 s is that same choice with `max_tokens` 1. A B2 step was about 0.187 s. 1.2975 / 7 forwards is 0.185 s, the same weight read.
+
+The ignored SDK test on `"Say hi"`, `max_tokens` 8, did not hit EOS. Three runs (SDK stream, raw SSE, non-stream) were prefill 0.2092 / 0.2082 / 0.2389 s and decode 1.2300 / 1.2538 / 1.2547 s, completion tokens 8, finish `length`.
+
+The B2 table is unchanged. This row is one request through HTTP, not the 256-token cache comparison. The ignored B2 test was re-run on this boot after the unused tail forward was removed: prompt 516, uncached 546.0694 s (0.4688 tok/s), cached decode 57.7040 s (4.4364 tok/s), **9.46×**, same greedy ids. Both sides were slower than the 2026-11-06 row (uncached 514.4022 s, decode 55.8705 s, 9.21×). One dropped forward in 256 is not what moved the ratio. The table above stays the B2 measurement.

@@ -10,8 +10,8 @@ mod model;
 mod sample;
 mod stream;
 
-pub use generate::{GenerateParams, Generated, StopReason, generate};
-pub use model::{Config, KvCache, QwenModel};
+pub use generate::{Control, GenerateParams, Generated, StopReason, generate, generate_with};
+pub use model::{Config, KvCache, QwenModel, tiny_model};
 pub use sample::{SampleError, greedy_token, sample_token};
 pub use stream::StreamDecoder;
 

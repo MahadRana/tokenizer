@@ -1,0 +1,33 @@
+[package]
+name = "qwen-server"
+version = "0.1.0"
+edition = "2024"
+description = "OpenAI-compatible HTTP API for Qwen2.5-0.5B-Instruct"
+
+[dependencies]
+# anyhow 1.0.104, the version already in Cargo.lock (B1). Exact pin: the
+# previous requirement was the caret-less "1", which is not a single release.
+anyhow = "=1.0.104"
+# axum 0.8.9 (crates.io, 2026-04-14). Docs: https://docs.rs/axum/0.8.9/axum/response/sse/struct.Sse.html
+# 0.8 path syntax is `/{id}`. This server's routes have no parameters.
+# SSE is `axum::response::sse::{Sse, Event, KeepAlive}`.
+axum = "=0.8.9"
+qwen-infer = { path = "../qwen-infer" }
+# serde 1.0.229 and serde_json 1.0.154 are the versions already in Cargo.lock.
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+# tokio 1.54.1 (crates.io, 2026-10-21). Docs: https://docs.rs/tokio/1.54.1/tokio/sync/mpsc/struct.Sender.html
+# `blocking_send` / `blocking_recv` panic if called from a runtime worker.
+# The engine thread is `std::thread`, so it is allowed to block there.
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "signal", "time"] }
+# tokio-stream 0.1.19 (crates.io, 2026-07-22). `sync` turns on `ReceiverStream`.
+# Docs: https://docs.rs/tokio-stream/0.1.19/tokio_stream/wrappers/struct.ReceiverStream.html
+tokio-stream = { version = "=0.1.19", features = ["sync"] }
+tokenizer = { path = ".." }
+
+[dev-dependencies]
+# reqwest 0.13.5 is already in Cargo.lock via hf-hub. `json` is the `.json()` body.
+reqwest = { version = "=0.13.5", features = ["json"] }
+# socket2 0.6.5 is already in Cargo.lock via tokio. The shutdown test shrinks
+# the client receive buffer so a stream that is never read fills the window.
+socket2 = "=0.6.5"
