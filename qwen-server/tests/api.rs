@@ -296,10 +296,10 @@ async fn shutdown_cancels_a_stream_the_client_never_reads() {
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut buf = [0u8; 256];
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
-    // Stop reading. The SSE task blocks once the socket window fills, the
-    // token channel (capacity 1) returns `TrySendError::Full`, and the engine
-    // sleeps instead of `blocking_send`. Wait until that Full is observed,
-    // then shut down. Shutdown has to notice the flag between those retries.
+    // Stop reading. The SSE task blocks once the socket window fills, and the
+    // token channel (capacity 1) returns `TrySendError::Full`. The engine
+    // parks that sequence instead of sleeping on it. Wait until that Full is
+    // observed, then shut down. Shutdown is checked between iterations.
     let mut stats = server.stats();
     let fill_deadline = std::time::Instant::now() + Duration::from_secs(5);
     while stats.token_channel_full == 0 && std::time::Instant::now() < fill_deadline {

@@ -5,17 +5,20 @@
 //! deque while the running batch has room, and runs one iteration: prefill
 //! each new sequence on its own, then one batched decode of the sequences
 //! that already have a cache. Tokens go out on the per-request
-//! `tokio::sync::mpsc` channel. `try_send` is the only send. A dropped
-//! receiver, or a send that fails, removes that sequence before the next
-//! iteration. Nothing wraps the batch in `Arc<Mutex>`.
+//! `tokio::sync::mpsc` channel. `try_send` is attempted once per sequence
+//! per iteration. A full channel parks that sequence; it does not sleep the
+//! thread. A dropped receiver, or a client that stays full past
+//! [`SLOW_CLIENT_TIMEOUT`], is removed before the next forward. Nothing
+//! wraps the batch in `Arc<Mutex>`.
 //!
-//! The thread is not a tokio worker. `blocking_send` would panic there, and
-//! it would also wait forever if the client stopped reading.
+//! The thread is not a tokio worker. `blocking_send` would panic there.
+//! Retrying one full channel in a loop would stall every other sequence,
+//! including `Done` for a request that is ready to finish.
 //!
-//! Shutdown sets an [`AtomicBool`] that this loop checks between iterations
-//! and while a token send is retrying a full channel. It does not abort a
-//! forward that has already entered candle. A batched matmul runs to
-//! completion; the flag is observed on the next iteration boundary.
+//! Shutdown sets an [`AtomicBool`] that this loop checks between iterations.
+//! It does not abort a forward that has already entered candle. A batched
+//! matmul runs to completion; the flag is observed on the next iteration
+//! boundary.
 
 use crate::TokenCodec;
 use crate::error::ApiError;
@@ -27,6 +30,28 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Unsent updates kept for one sequence. The HTTP channel holds one item.
+/// This cap absorbs a client that is a few chunks behind. Past it the
+/// sequence is cancelled rather than given a longer queue: generating into
+/// an unread buffer pins a batch slot and the bytes.
+const MAX_PENDING_UPDATES: usize = 8;
+
+/// How long one sequence may keep an update the client has not taken.
+///
+/// The engine does not sleep on that sequence. Each iteration tries the send
+/// once. This deadline is only when that try keeps failing, so a stuck
+/// client loses its slot and the others keep the thread. Two seconds is
+/// longer than one real-weight decode step (~0.2 s) and longer than a
+/// scheduling gap, and short enough that a client which never reads does
+/// not occupy `max_batch_size` for the life of the process.
+const SLOW_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// When every running sequence is waiting on its client, block here for a
+/// new request instead of spinning on `try_send`. One wait for the thread,
+/// shared by every blocked sequence. A sequence that can run is never delayed
+/// by another sequence's full channel.
+const BLOCKED_RETRY_WAIT: Duration = Duration::from_millis(5);
+
 /// What the HTTP side last saw the engine do. Tests read this after a
 /// disconnect. `last_*` is the most recently retired sequence, not a history.
 #[derive(Debug, Clone, Default)]
@@ -37,9 +62,9 @@ pub struct EngineStats {
     pub last_completion_tokens: u64,
     pub last_max_tokens: u64,
     pub requests_finished: u64,
-    /// Times a per-request token send saw [`mpsc::error::TrySendError::Full`].
-    /// The shutdown test reads this so a fast client is not mistaken for the
-    /// channel-full backpressure path.
+    /// Times a per-request `try_send` saw [`mpsc::error::TrySendError::Full`].
+    /// Counted once per failed attempt. The engine does not retry that send
+    /// in a loop, so this is not a spin counter.
     pub token_channel_full: u64,
     /// Largest running batch this process has admitted.
     pub max_running: u64,
@@ -141,6 +166,16 @@ struct Sequence {
     stream: bool,
     phase: Phase,
     cursor: SampleCursor,
+    /// Updates the client has not accepted yet. Empty means the sequence may
+    /// run a forward. Non-empty means the last `try_send` was [`mpsc::error::TrySendError::Full`]
+    /// and this sequence waits for a later iteration.
+    pending: VecDeque<GenUpdate>,
+    /// Set on the first failed flush of the current backlog. Cleared when
+    /// `pending` drains. Compared to [`SLOW_CLIENT_TIMEOUT`].
+    blocked_since: Option<Instant>,
+    /// Generation has finished, but `Done` (or the finish itself) is still
+    /// sitting in `pending`. Moved to `outcome` once the client takes it.
+    held_outcome: Option<Outcome>,
     outcome: Option<Outcome>,
     prefill: Duration,
     /// Sum of this sequence's share of each batched decode it joined.
@@ -233,13 +268,41 @@ pub fn engine_thread(
         }
 
         // A client that dropped before this iteration must not take a slot
-        // in the matmul. The send-failure path below covers a drop that
-        // happens during the forward: the token send fails and the sequence
-        // is removed before the next iteration.
+        // in the matmul. `flush_all` is one `try_send` per blocked sequence.
+        // It does not sleep. A sequence that is still full stays in `running`
+        // and is not forwarded.
         mark_closed(&mut running);
+        flush_all(&mut running, &shutdown, &stats);
         evict_finished(&mut running, &inflight, &stats);
         if running.is_empty() {
             stats.lock().expect("engine stats").active = false;
+            if ingress_closed {
+                break;
+            }
+            continue;
+        }
+        let runnable = running.iter().any(can_forward);
+        if !runnable {
+            stats.lock().expect("engine stats").active = true;
+            // Nobody can run a forward. Wait for a new request, or a short
+            // shared timeout, then retry every blocked send once. This is
+            // the only sleep, and it is not inside one sequence.
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            if !ingress_closed {
+                match rx.recv_timeout(BLOCKED_RETRY_WAIT) {
+                    Ok(req) => {
+                        if let Some(seq) =
+                            accept(req, &mut next_id, layers, &inflight, &shutdown, &stats)
+                        {
+                            waiting.push_back(seq);
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => ingress_closed = true,
+                }
+            }
             continue;
         }
 
@@ -273,7 +336,7 @@ fn accept(
     let id = *next_id;
     *next_id = next_id.saturating_add(1);
     if req.prompt_ids.is_empty() {
-        let _ = send_update(
+        let _ = try_send_once(
             &req.tx,
             shutdown,
             stats,
@@ -285,7 +348,7 @@ fn accept(
     let cursor = match SampleCursor::new(req.params.clone()) {
         Ok(cursor) => cursor,
         Err(err) => {
-            let _ = send_update(&req.tx, shutdown, stats, GenUpdate::Failed(err.to_string()));
+            let _ = try_send_once(&req.tx, shutdown, stats, GenUpdate::Failed(err.to_string()));
             inflight.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -302,6 +365,9 @@ fn accept(
         stream: req.stream,
         phase: Phase::Prefill,
         cursor,
+        pending: VecDeque::new(),
+        blocked_since: None,
+        held_outcome: None,
         outcome: None,
         prefill: Duration::ZERO,
         decode: Duration::ZERO,
@@ -314,8 +380,8 @@ fn accept(
 /// loop does not pack them into one matmul. A new sequence is sampled from
 /// its prompt logits in this same iteration; the token it just drew is
 /// forwarded on the next iteration, with whoever else is still running.
-/// Shutdown cannot cut the forwards short. The flag is read when a token is
-/// sent, which is after those forwards return.
+/// Shutdown cannot cut the forwards short. The flag is read after those
+/// forwards return, when the new update is flushed.
 fn step_batch(
     model: &qwen_infer::QwenModel,
     codec: &dyn TokenCodec,
@@ -327,7 +393,9 @@ fn step_batch(
     let mut prefilling = Vec::new();
     let mut decoding = Vec::new();
     for seq in running.drain(..) {
-        if seq.outcome.is_some() {
+        // Output-blocked sequences are not forwarded. Their unsent update is
+        // retried by `flush_all` on the next iteration, once, with everyone else.
+        if seq.outcome.is_some() || !seq.pending.is_empty() {
             parked.push(seq);
             continue;
         }
@@ -419,6 +487,8 @@ fn push_sample(
 ) {
     let tx = seq.tx.clone();
     let stream = seq.stream;
+    let queued = seq.pending.len();
+    let mut deltas = Vec::new();
     let result = seq.cursor.push_logits(
         logits,
         |id| codec.decode_token(id),
@@ -429,37 +499,51 @@ fn push_sample(
             if chunk.is_empty() || !stream {
                 return Control::Continue;
             }
-            if send_update(&tx, shutdown, stats, GenUpdate::Delta(chunk.to_string())) {
-                Control::Continue
-            } else {
-                Control::Stop
+            // The chunk is queued and flushed after `push_logits` returns.
+            // Stopping here is the cap, not a full channel: a full channel
+            // parks the sequence instead of cancelling it on the first miss.
+            if queued + deltas.len() + 1 > MAX_PENDING_UPDATES {
+                return Control::Stop;
             }
+            deltas.push(GenUpdate::Delta(chunk.to_string()));
+            Control::Continue
         },
     );
+    seq.pending.extend(deltas);
     match result {
         Ok(SampleNext::Forward(id)) => {
             seq.tokens = seq.cursor.tokens().to_vec();
             seq.phase = Phase::Decode(id);
+            flush_pending(seq, shutdown, stats);
         }
         Ok(SampleNext::Done(done)) => {
             seq.tokens.clone_from(&done.tokens);
-            let mut reason = done.reason;
             let completion = done.completion_tokens;
-            if reason != StopReason::Cancelled {
-                let update = GenUpdate::Done(Done {
+            if done.reason == StopReason::Cancelled {
+                seq.pending.clear();
+                seq.held_outcome = None;
+                seq.outcome = Some(Outcome::Finished {
+                    reason: StopReason::Cancelled,
+                    completion,
+                });
+            } else if seq.pending.len() >= MAX_PENDING_UPDATES {
+                cancel_slow(seq);
+            } else {
+                seq.pending.push_back(GenUpdate::Done(Done {
                     text: done.text,
-                    reason,
+                    reason: done.reason,
                     prompt_tokens: seq.prompt_tokens,
                     completion_tokens: u32::try_from(completion).unwrap_or(u32::MAX),
                     tokens: done.tokens,
+                }));
+                // Delivered inside `flush_pending` once `pending` is empty.
+                // Until then the sequence stays running and is not forwarded.
+                seq.held_outcome = Some(Outcome::Finished {
+                    reason: done.reason,
+                    completion,
                 });
-                // A failed Done send is the same cancel as a failed delta:
-                // the client is gone, and this sequence leaves the batch.
-                if !send_update(&tx, shutdown, stats, update) {
-                    reason = StopReason::Cancelled;
-                }
+                flush_pending(seq, shutdown, stats);
             }
-            seq.outcome = Some(Outcome::Finished { reason, completion });
         }
         Err(err) => fail_sequence(seq, &err, shutdown, stats),
     }
@@ -472,7 +556,10 @@ fn fail_sequence(
     stats: &Mutex<EngineStats>,
 ) {
     eprintln!("engine id {} error: {err}", seq.id);
-    let _ = send_update(&seq.tx, shutdown, stats, GenUpdate::Failed(err.to_string()));
+    // One try. A full channel must not keep the thread on this error.
+    let _ = try_send_once(&seq.tx, shutdown, stats, GenUpdate::Failed(err.to_string()));
+    seq.pending.clear();
+    seq.held_outcome = None;
     seq.outcome = Some(Outcome::Failed);
 }
 
@@ -540,29 +627,103 @@ fn retire(seq: Sequence, inflight: &AtomicUsize, stats: &Mutex<EngineStats>, sti
     }
 }
 
-/// Push one update without parking the engine until the client reads.
+fn can_forward(seq: &Sequence) -> bool {
+    seq.outcome.is_none() && seq.pending.is_empty()
+}
+
+fn flush_all(running: &mut [Sequence], shutdown: &AtomicBool, stats: &Mutex<EngineStats>) {
+    for seq in running.iter_mut() {
+        flush_pending(seq, shutdown, stats);
+    }
+}
+
+/// Send queued updates until one does not fit.
 ///
-/// `false` means the caller should stop the sequence. A full channel
-/// increments [`EngineStats::token_channel_full`] and sleeps, so shutdown
-/// is still noticed. `blocking_send` is not used.
-fn send_update(
+/// A full channel is recorded and the update stays at the front of
+/// `pending`. The caller returns to the scheduler. The next iteration tries
+/// this sequence once more, after every other sequence has had the same
+/// chance. There is no sleep on this path.
+///
+/// The sequence is cancelled when the backlog would pass
+/// [`MAX_PENDING_UPDATES`] or the oldest unsent update is older than
+/// [`SLOW_CLIENT_TIMEOUT`]. That is a deadline checked on a failed try, not
+/// a wait. A client that is merely a chunk behind is parked, not dropped.
+fn flush_pending(seq: &mut Sequence, shutdown: &AtomicBool, stats: &Mutex<EngineStats>) {
+    if seq.outcome.is_some() {
+        return;
+    }
+    if shutdown.load(Ordering::SeqCst) {
+        cancel_slow(seq);
+        return;
+    }
+    loop {
+        let Some(update) = seq.pending.pop_front() else {
+            seq.blocked_since = None;
+            if let Some(outcome) = seq.held_outcome.take() {
+                seq.outcome = Some(outcome);
+            }
+            return;
+        };
+        match seq.tx.try_send(update) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                cancel_slow(seq);
+                return;
+            }
+            Err(mpsc::error::TrySendError::Full(value)) => {
+                seq.pending.push_front(value);
+                note_full(stats);
+                let since = seq.blocked_since.get_or_insert_with(Instant::now);
+                if seq.pending.len() > MAX_PENDING_UPDATES || since.elapsed() >= SLOW_CLIENT_TIMEOUT
+                {
+                    cancel_slow(seq);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn cancel_slow(seq: &mut Sequence) {
+    let completion = seq
+        .held_outcome
+        .as_ref()
+        .map(|outcome| match outcome {
+            Outcome::Finished { completion, .. } => *completion,
+            Outcome::Failed => seq.tokens.len(),
+        })
+        .unwrap_or(seq.tokens.len());
+    seq.pending.clear();
+    seq.held_outcome = None;
+    seq.blocked_since = None;
+    seq.outcome = Some(Outcome::Finished {
+        reason: StopReason::Cancelled,
+        completion,
+    });
+}
+
+fn note_full(stats: &Mutex<EngineStats>) {
+    stats.lock().expect("engine stats").token_channel_full += 1;
+}
+
+/// One attempt, for a message that is not part of a sequence backlog
+/// (a request rejected before it is admitted, or a forward error).
+/// `false` means it was not delivered. The caller does not retry.
+fn try_send_once(
     tx: &mpsc::Sender<GenUpdate>,
     shutdown: &AtomicBool,
     stats: &Mutex<EngineStats>,
-    mut update: GenUpdate,
+    update: GenUpdate,
 ) -> bool {
-    loop {
-        if shutdown.load(Ordering::SeqCst) || tx.is_closed() {
-            return false;
-        }
-        match tx.try_send(update) {
-            Ok(()) => return true,
-            Err(mpsc::error::TrySendError::Closed(_)) => return false,
-            Err(mpsc::error::TrySendError::Full(value)) => {
-                update = value;
-                stats.lock().expect("engine stats").token_channel_full += 1;
-                std::thread::sleep(Duration::from_millis(5));
-            }
+    if shutdown.load(Ordering::SeqCst) || tx.is_closed() {
+        return false;
+    }
+    match tx.try_send(update) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            note_full(stats);
+            false
         }
     }
 }
@@ -874,6 +1035,94 @@ mod tests {
         release_tx.send(()).unwrap();
         shutdown.store(true, Ordering::SeqCst);
         drop(long_rx);
+        drop(ingress);
+        handle.join().expect("join");
+    }
+
+    /// A receiver that is connected and never read fills its channel. The
+    /// engine records `Full` and keeps running the other request. That
+    /// request's `Done` arrives before this test drains or drops the stalled
+    /// receiver.
+    #[test]
+    fn stalled_receiver_full_lets_the_other_request_finish() {
+        let (tx, rx) = sync_channel(8);
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(EngineStats::default()));
+        let ingress = Ingress::new(tx, Arc::clone(&inflight), 4, 4);
+
+        // Capacity 1, so the second delta is `TrySendError::Full`.
+        let (stall_tx, mut stall_rx) = mpsc::channel(1);
+        try_enqueue(
+            &ingress,
+            GenRequest {
+                prompt_ids: vec![1, 2, 3, 4],
+                params: GenerateParams::greedy(40),
+                stream: true,
+                tx: stall_tx,
+            },
+        )
+        .unwrap();
+        let (ok_req, ok_rx) = open_request(vec![8, 7, 6], 3, false);
+        try_enqueue(&ingress, ok_req).unwrap();
+
+        let handle = std::thread::Builder::new()
+            .name("qwen-engine".into())
+            .spawn({
+                let shutdown = Arc::clone(&shutdown);
+                let stats = Arc::clone(&stats);
+                let inflight = Arc::clone(&inflight);
+                move || {
+                    engine_thread(
+                        rx,
+                        qwen_infer::tiny_model(false),
+                        Arc::new(UnitCodec),
+                        shutdown,
+                        stats,
+                        inflight,
+                        4,
+                    );
+                }
+            })
+            .expect("spawn");
+
+        let done = take_done(ok_rx);
+        let alone = qwen_infer::generate(
+            &qwen_infer::tiny_model(false),
+            &[8, 7, 6],
+            &GenerateParams::greedy(3),
+            unit_bytes,
+        )
+        .unwrap();
+        assert_eq!(done.tokens, alone.tokens);
+        assert_eq!(done.reason, alone.reason);
+
+        let stats_now = stats.lock().expect("stats").clone();
+        assert!(
+            stats_now.token_channel_full > 0,
+            "stalled receiver never returned Full: {stats_now:?}"
+        );
+        assert_eq!(
+            stats_now.requests_finished, 1,
+            "the stalled request must still be in the batch: {stats_now:?}"
+        );
+        assert!(stats_now.active, "{stats_now:?}");
+
+        // One delta fit in the channel. Reading that one item is the check
+        // that the sender is still alive. The following recv must be Empty:
+        // the rest is parked on the engine, and the receiver has not been
+        // dropped. This test does not read any further.
+        assert!(
+            matches!(stall_rx.try_recv(), Ok(GenUpdate::Delta(_))),
+            "the single buffered delta was not sitting unread"
+        );
+        assert!(
+            matches!(stall_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "stalled receiver was drained or dropped"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        drop(stall_rx);
         drop(ingress);
         handle.join().expect("join");
     }

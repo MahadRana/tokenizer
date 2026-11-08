@@ -183,3 +183,24 @@ The prompt is a chat turn, not the raw string from B1. The template adds the def
 The ignored SDK test on `"Say hi"`, `max_tokens` 8, did not hit EOS. Three runs (SDK stream, raw SSE, non-stream) were prefill 0.2092 / 0.2082 / 0.2389 s and decode 1.2300 / 1.2538 / 1.2547 s, completion tokens 8, finish `length`.
 
 The B2 table is unchanged. This row is one request through HTTP, not the 256-token cache comparison. The ignored B2 test was re-run on this boot after the unused tail forward was removed: prompt 516, uncached 546.0694 s (0.4688 tok/s), cached decode 57.7040 s (4.4364 tok/s), **9.46×**, same greedy ids. Both sides were slower than the 2026-11-06 row (uncached 514.4022 s, decode 55.8705 s, 9.21×). One dropped forward in 256 is not what moved the ratio. The table above stays the B2 measurement.
+
+## B4: eight concurrent requests, one warmed sample
+
+Not a sustained run, and not a percentile. One process, temperature 0, EOS off so each call runs all 16 tokens. A warmup request of the same shape runs first and is not in the table. The single row is the next request. The batch row is eight of those requests issued together: 8 × 16 = **128** completion tokens, wall time from the first send to the last body. Total tok/s is that token count divided by that wall time. The ratio is the batch rate divided by the single rate. Client text matched across the eight and the single call.
+
+Measured 2026-11-08, branch `feat/b4-continuous-batching`, rustc 1.99.1 (58cf8f9c3 2026-10-13), candle-core 0.11.1, candle-nn 0.11.1, `DType::F32`, `Device::Cpu`. Same machine as the B2 and B3 rows.
+
+- Linux 6.12.113+ x86_64, KVM guest
+- 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores.
+- MemTotal 16,387,328 kB
+
+| run | completion tokens | wall | total tok/s |
+|---|---|---|---|
+| one request, after one warmup | 16 | **2.8346 s** | **5.6444** |
+| 8 concurrent | 128 | **3.7229 s** | **34.3820** |
+
+34.38 tok/s vs 5.64 tok/s is **6.09×** (34.3820 / 5.6444). Prefill of each prompt is still its own forward. The shared work is the decode steps.
+
+A separate call, not folded into the ratio: one 12-token stream was already producing content, then a 1-token request was sent. Client TTFT for that short request was **0.5532 s**, text `Hello`. The long request was still running (`max_running` 2) and was cancelled at 4 completion tokens when the test dropped it. One sample, not a latency distribution.
+
+A second sample after the slow-client send path landed is not a replacement. Same commands, same machine: single **2.9118 s** (**5.4949 tok/s**), batch **3.7862 s** (**33.8067 tok/s**, **6.15×**), short TTFT **0.5710 s**. The table above stays the first sample.
