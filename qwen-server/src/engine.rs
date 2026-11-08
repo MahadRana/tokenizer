@@ -173,8 +173,9 @@ struct Sequence {
     /// Set on the first failed flush of the current backlog. Cleared when
     /// `pending` drains. Compared to [`SLOW_CLIENT_TIMEOUT`].
     blocked_since: Option<Instant>,
-    /// Generation has finished, but `Done` (or the finish itself) is still
-    /// sitting in `pending`. Moved to `outcome` once the client takes it.
+    /// Generation has finished, but the terminal `Done` or `Failed` is still
+    /// sitting in `pending`. Moved to `outcome` once the client takes it,
+    /// which is when the reservation is released.
     held_outcome: Option<Outcome>,
     outcome: Option<Outcome>,
     prefill: Duration,
@@ -556,11 +557,22 @@ fn fail_sequence(
     stats: &Mutex<EngineStats>,
 ) {
     eprintln!("engine id {} error: {err}", seq.id);
-    // One try. A full channel must not keep the thread on this error.
-    let _ = try_send_once(&seq.tx, shutdown, stats, GenUpdate::Failed(err.to_string()));
-    seq.pending.clear();
-    seq.held_outcome = None;
-    seq.outcome = Some(Outcome::Failed);
+    if seq.outcome.is_some() {
+        return;
+    }
+    // `Failed` is terminal output, same as `Done`. A full channel keeps it
+    // in `pending` and `flush_all` retries it once per iteration. The
+    // sequence stays reserved until that send lands, or until the client
+    // drops or [`SLOW_CLIENT_TIMEOUT`] cancels it. Retiring here would drop
+    // the sender, and an SSE client that still had one delta buffered would
+    // read that delta and then EOF, with no error event and no `[DONE]`.
+    // Oldest unsent updates are dropped only to keep the error inside the cap.
+    while seq.pending.len() >= MAX_PENDING_UPDATES {
+        seq.pending.pop_front();
+    }
+    seq.pending.push_back(GenUpdate::Failed(err.to_string()));
+    seq.held_outcome = Some(Outcome::Failed);
+    flush_pending(seq, shutdown, stats);
 }
 
 fn mark_closed(running: &mut [Sequence]) {
@@ -707,8 +719,9 @@ fn note_full(stats: &Mutex<EngineStats>) {
 }
 
 /// One attempt, for a message that is not part of a sequence backlog
-/// (a request rejected before it is admitted, or a forward error).
+/// (a request rejected before it is admitted).
 /// `false` means it was not delivered. The caller does not retry.
+/// A forward error is not sent here: [`fail_sequence`] queues it.
 fn try_send_once(
     tx: &mpsc::Sender<GenUpdate>,
     shutdown: &AtomicBool,
@@ -1125,5 +1138,155 @@ mod tests {
         drop(stall_rx);
         drop(ingress);
         handle.join().expect("join");
+    }
+
+    /// The token channel is already full when generation fails. `Failed`
+    /// stays pending, a peer request still finishes, and the reservation
+    /// drops only after the client has taken the error. That update is the
+    /// SSE error event; [`crate::http::failure_frame`] is the `[DONE]` that
+    /// follows it.
+    #[test]
+    fn failed_while_full_is_delivered_and_the_peer_still_runs() {
+        let model = qwen_infer::tiny_model(false);
+        let fail_prompt = vec![1u32, 2, 3, 4];
+        let peer_prompt = vec![9u32, 8, 7, 5];
+        let fail_ids =
+            qwen_infer::generate(&model, &fail_prompt, &GenerateParams::greedy(2), unit_bytes)
+                .unwrap()
+                .tokens;
+        let peer_ids =
+            qwen_infer::generate(&model, &peer_prompt, &GenerateParams::greedy(4), unit_bytes)
+                .unwrap()
+                .tokens;
+        let poison = fail_ids[1];
+        assert_ne!(fail_ids[0], poison, "first token must occupy the channel");
+        assert!(
+            !peer_ids.contains(&poison),
+            "peer ids {peer_ids:?} collide with poison {poison}"
+        );
+
+        let (tx, rx) = sync_channel(8);
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(EngineStats::default()));
+        let ingress = Ingress::new(tx, Arc::clone(&inflight), 4, 4);
+
+        let (fail_tx, mut fail_rx) = mpsc::channel(1);
+        try_enqueue(
+            &ingress,
+            GenRequest {
+                prompt_ids: fail_prompt,
+                params: GenerateParams::greedy(8),
+                stream: true,
+                tx: fail_tx,
+            },
+        )
+        .unwrap();
+        let (peer_req, peer_rx) = open_request(peer_prompt.clone(), 4, false);
+        try_enqueue(&ingress, peer_req).unwrap();
+        assert_eq!(inflight.load(Ordering::SeqCst), 2);
+
+        let handle = std::thread::Builder::new()
+            .name("qwen-engine".into())
+            .spawn({
+                let shutdown = Arc::clone(&shutdown);
+                let stats = Arc::clone(&stats);
+                let inflight = Arc::clone(&inflight);
+                move || {
+                    engine_thread(
+                        rx,
+                        qwen_infer::tiny_model(false),
+                        Arc::new(PoisonCodec { poison }),
+                        shutdown,
+                        stats,
+                        inflight,
+                        4,
+                    );
+                }
+            })
+            .expect("spawn");
+
+        let peer = take_done(peer_rx);
+        assert_eq!(peer.tokens, peer_ids);
+        let stats_now = stats.lock().expect("stats").clone();
+        assert!(
+            stats_now.token_channel_full > 0,
+            "Failed was not attempted against a full channel: {stats_now:?}"
+        );
+        assert_eq!(
+            stats_now.requests_finished, 1,
+            "the failed request must still be reserved: {stats_now:?}"
+        );
+        assert_eq!(inflight.load(Ordering::SeqCst), 1);
+        assert!(stats_now.active, "{stats_now:?}");
+
+        // The delta that filled the channel is still unread. Taking it is
+        // what lets the parked `Failed` send on the next fair retry.
+        assert!(
+            matches!(fail_rx.try_recv(), Ok(GenUpdate::Delta(_))),
+            "expected the unread delta that made the channel Full"
+        );
+        let failed = wait_update(&mut fail_rx);
+        let GenUpdate::Failed(message) = failed else {
+            panic!("expected the error update, got something else");
+        };
+        assert!(message.contains(&poison.to_string()), "{message}");
+        let (error_event, done) = crate::http::failure_frame(&message);
+        let parsed: serde_json::Value = serde_json::from_str(&error_event).unwrap();
+        assert_eq!(parsed["error"]["type"], "server_error");
+        assert_eq!(parsed["error"]["message"], message);
+        assert_eq!(done, "[DONE]");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while inflight.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            inflight.load(Ordering::SeqCst),
+            0,
+            "reservation held after the error was delivered"
+        );
+        let stats_done = stats.lock().expect("stats").clone();
+        assert_eq!(stats_done.requests_finished, 2, "{stats_done:?}");
+        assert!(!stats_done.active, "{stats_done:?}");
+
+        shutdown.store(true, Ordering::SeqCst);
+        drop(fail_rx);
+        drop(ingress);
+        handle.join().expect("join");
+    }
+
+    struct PoisonCodec {
+        poison: u32,
+    }
+
+    impl TokenCodec for PoisonCodec {
+        fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
+            TokenCodec::encode(&UnitCodec, text)
+        }
+
+        fn decode_token(&self, id: u32) -> Result<Vec<u8>, TokenizerError> {
+            if id == self.poison {
+                Err(TokenizerError::UnknownToken(id))
+            } else {
+                unit_bytes(id)
+            }
+        }
+    }
+
+    fn wait_update(rx: &mut mpsc::Receiver<GenUpdate>) -> GenUpdate {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(update) => return update,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("sender dropped before Failed was delivered")
+                }
+            }
+        }
+        panic!("timed out waiting for the error update");
     }
 }
