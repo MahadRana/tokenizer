@@ -164,6 +164,179 @@ impl StepModel for QwenStep<'_> {
     }
 }
 
+/// One sequence's sampler: RNG, decoded text, and the stop-string hold.
+///
+/// The KV cache is not in here. The caller runs the forward and passes the
+/// logits back to [`SampleCursor::push_logits`]. A batch keeps one cursor per
+/// sequence and one cache per sequence; nothing here knows about the others.
+pub struct SampleCursor {
+    params: GenerateParams,
+    rng: StdRng,
+    decoder: StreamDecoder,
+    held: StopHold,
+    tokens: Vec<u32>,
+    chunks: Vec<String>,
+    text: String,
+    produced: usize,
+}
+
+/// What [`SampleCursor::push_logits`] wants the caller to do next.
+pub enum SampleNext {
+    /// Forward this id at `cache.seq_len()`. The token is already in
+    /// [`SampleCursor::tokens`].
+    Forward(u32),
+    /// Stop conditions are done, including the end-of-stream flush.
+    Done(Sampled),
+}
+
+/// The sampled half of [`Generated`], without the prefill and decode clocks.
+/// The caller owns those, because a batched step's wall time is not one
+/// sequence's time.
+#[derive(Debug, Clone)]
+pub struct Sampled {
+    pub tokens: Vec<u32>,
+    pub text: String,
+    pub chunks: Vec<String>,
+    pub reason: StopReason,
+    pub completion_tokens: usize,
+}
+
+impl SampleCursor {
+    /// `params` is checked the same way [`generate`] checks it.
+    pub fn new(params: GenerateParams) -> anyhow::Result<Self> {
+        validate(&params)?;
+        Ok(Self {
+            rng: StdRng::seed_from_u64(params.seed),
+            params,
+            decoder: StreamDecoder::new(),
+            held: StopHold::default(),
+            tokens: Vec::new(),
+            chunks: Vec::new(),
+            text: String::new(),
+            produced: 0,
+        })
+    }
+
+    /// Ids sampled so far, excluding an EOS id.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// Draw the next id from `logits`, or finish if `max_tokens` is already met.
+    ///
+    /// `token_bytes` and `on_chunk` are the same callbacks [`generate_with`]
+    /// uses. [`Control::Stop`] from `on_chunk` finishes as
+    /// [`StopReason::Cancelled`] and does not ask for another forward.
+    /// [`StopReason::MaxTokens`] and [`StopReason::Eos`] flush the decoder;
+    /// a stop string and a cancel do not.
+    pub fn push_logits(
+        &mut self,
+        logits: &[f32],
+        mut token_bytes: impl FnMut(u32) -> Result<Vec<u8>, TokenizerError>,
+        mut on_chunk: impl FnMut(&str) -> Control,
+    ) -> anyhow::Result<SampleNext> {
+        if self.produced >= self.params.max_tokens {
+            return Ok(SampleNext::Done(
+                self.finish(StopReason::MaxTokens, &mut on_chunk),
+            ));
+        }
+        let id = sample::sample_token(
+            logits,
+            self.params.temperature,
+            self.params.top_p,
+            &mut self.rng,
+        )?;
+        if self.params.eos.contains(&id) {
+            self.produced += 1;
+            return Ok(SampleNext::Done(
+                self.finish(StopReason::Eos, &mut on_chunk),
+            ));
+        }
+        let bytes = token_bytes(id)?;
+        let piece = self.decoder.push(&bytes);
+        let control = match self.held.push(&piece, &self.params.stop) {
+            HoldOut::Stop(chunk) => {
+                self.tokens.push(id);
+                self.produced += 1;
+                let control = observe(&mut on_chunk, &chunk, &mut self.chunks, &mut self.text);
+                let reason = if control == Control::Stop {
+                    StopReason::Cancelled
+                } else {
+                    StopReason::StopString
+                };
+                return Ok(SampleNext::Done(self.snapshot(reason)));
+            }
+            HoldOut::Continue(chunk) => {
+                self.tokens.push(id);
+                self.produced += 1;
+                observe(&mut on_chunk, &chunk, &mut self.chunks, &mut self.text)
+            }
+        };
+        if control == Control::Stop {
+            return Ok(SampleNext::Done(self.snapshot(StopReason::Cancelled)));
+        }
+        if self.produced >= self.params.max_tokens {
+            return Ok(SampleNext::Done(
+                self.finish(StopReason::MaxTokens, &mut on_chunk),
+            ));
+        }
+        Ok(SampleNext::Forward(id))
+    }
+
+    /// End the stream without drawing. `max_tokens == 0` takes this path.
+    /// The decoder flush still runs, which is what [`generate`] does after a
+    /// prefill it is not allowed to sample from.
+    pub fn finish_without_sample(&mut self, mut on_chunk: impl FnMut(&str) -> Control) -> Sampled {
+        self.finish(StopReason::MaxTokens, &mut on_chunk)
+    }
+
+    fn snapshot(&self, reason: StopReason) -> Sampled {
+        Sampled {
+            tokens: self.tokens.clone(),
+            text: self.text.clone(),
+            chunks: self.chunks.clone(),
+            reason,
+            completion_tokens: self.produced,
+        }
+    }
+
+    fn finish(
+        &mut self,
+        mut reason: StopReason,
+        on_chunk: &mut impl FnMut(&str) -> Control,
+    ) -> Sampled {
+        if matches!(reason, StopReason::MaxTokens | StopReason::Eos) {
+            let flushed = self.decoder.finish();
+            if !flushed.is_empty() {
+                match self.held.push(&flushed, &self.params.stop) {
+                    HoldOut::Stop(chunk) => {
+                        let control = observe(on_chunk, &chunk, &mut self.chunks, &mut self.text);
+                        reason = if control == Control::Stop {
+                            StopReason::Cancelled
+                        } else {
+                            StopReason::StopString
+                        };
+                    }
+                    HoldOut::Continue(chunk) => {
+                        let first = observe(on_chunk, &chunk, &mut self.chunks, &mut self.text);
+                        let tail = self.held.finish();
+                        let second = observe(on_chunk, &tail, &mut self.chunks, &mut self.text);
+                        if first == Control::Stop || second == Control::Stop {
+                            reason = StopReason::Cancelled;
+                        }
+                    }
+                }
+            } else {
+                let tail = self.held.finish();
+                if observe(on_chunk, &tail, &mut self.chunks, &mut self.text) == Control::Stop {
+                    reason = StopReason::Cancelled;
+                }
+            }
+        }
+        self.snapshot(reason)
+    }
+}
+
 fn generate_loop(
     step: &mut impl StepModel,
     prompt: &[u32],
@@ -176,110 +349,45 @@ fn generate_loop(
         anyhow::bail!("prompt encoded to no tokens");
     }
 
-    let mut rng = StdRng::seed_from_u64(params.seed);
+    let mut cursor = SampleCursor::new(params.clone())?;
     let prefill_started = std::time::Instant::now();
     let mut logits = step.forward_tokens(prompt)?;
     let prefill = prefill_started.elapsed();
-
-    let mut decoder = StreamDecoder::new();
-    let mut held = StopHold::default();
-    let mut tokens = Vec::new();
-    let mut chunks = Vec::new();
-    let mut text = String::new();
     let decode_started = std::time::Instant::now();
-    let mut reason = StopReason::MaxTokens;
-    let mut produced = 0usize;
 
-    if params.max_tokens > 0 {
-        if on_chunk("") == Control::Stop {
-            reason = StopReason::Cancelled;
-        } else {
-            loop {
-                if produced >= params.max_tokens {
-                    reason = StopReason::MaxTokens;
-                    break;
+    // `max_tokens == 0` still prefilled, matching the old loop, and then
+    // flushes. The empty-chunk probe is only for a run that is allowed to
+    // sample: it is how a dropped client cancels before the first draw.
+    let done = if params.max_tokens == 0 {
+        cursor.finish_without_sample(&mut on_chunk)
+    } else if on_chunk("") == Control::Stop {
+        Sampled {
+            tokens: Vec::new(),
+            text: String::new(),
+            chunks: Vec::new(),
+            reason: StopReason::Cancelled,
+            completion_tokens: 0,
+        }
+    } else {
+        loop {
+            match cursor.push_logits(&logits, &mut token_bytes, &mut on_chunk)? {
+                SampleNext::Forward(id) => {
+                    // The sample that filled `max_tokens` returns `Done` above
+                    // and never reaches this forward.
+                    logits = step.forward_tokens(&[id])?;
                 }
-                let id = sample::sample_token(&logits, params.temperature, params.top_p, &mut rng)?;
-                if params.eos.contains(&id) {
-                    produced += 1;
-                    reason = StopReason::Eos;
-                    break;
-                }
-                let bytes = token_bytes(id)?;
-                let piece = decoder.push(&bytes);
-                let control = match held.push(&piece, &params.stop) {
-                    HoldOut::Stop(chunk) => {
-                        tokens.push(id);
-                        produced += 1;
-                        let control = observe(&mut on_chunk, &chunk, &mut chunks, &mut text);
-                        reason = if control == Control::Stop {
-                            StopReason::Cancelled
-                        } else {
-                            StopReason::StopString
-                        };
-                        break;
-                    }
-                    HoldOut::Continue(chunk) => {
-                        tokens.push(id);
-                        produced += 1;
-                        observe(&mut on_chunk, &chunk, &mut chunks, &mut text)
-                    }
-                };
-                if control == Control::Stop {
-                    reason = StopReason::Cancelled;
-                    break;
-                }
-                // The sample that filled `max_tokens` has nowhere to go.
-                // Forwarding it would build logits for a token we must not
-                // draw. EOS and stop-string breaks above take the same exit.
-                if produced >= params.max_tokens {
-                    reason = StopReason::MaxTokens;
-                    break;
-                }
-                logits = step.forward_tokens(&[id])?;
+                SampleNext::Done(done) => break done,
             }
         }
-    }
-
-    if matches!(reason, StopReason::MaxTokens | StopReason::Eos) {
-        // The decoder may still be holding a split character. `finish` is the
-        // end of the stream, so a replacement here is not a mid-stream guess.
-        // A cancel leaves that tail alone: the client is already gone.
-        let flushed = decoder.finish();
-        if !flushed.is_empty() {
-            match held.push(&flushed, &params.stop) {
-                HoldOut::Stop(chunk) => {
-                    let control = observe(&mut on_chunk, &chunk, &mut chunks, &mut text);
-                    reason = if control == Control::Stop {
-                        StopReason::Cancelled
-                    } else {
-                        StopReason::StopString
-                    };
-                }
-                HoldOut::Continue(chunk) => {
-                    let first = observe(&mut on_chunk, &chunk, &mut chunks, &mut text);
-                    let tail = held.finish();
-                    let second = observe(&mut on_chunk, &tail, &mut chunks, &mut text);
-                    if first == Control::Stop || second == Control::Stop {
-                        reason = StopReason::Cancelled;
-                    }
-                }
-            }
-        } else {
-            let tail = held.finish();
-            if observe(&mut on_chunk, &tail, &mut chunks, &mut text) == Control::Stop {
-                reason = StopReason::Cancelled;
-            }
-        }
-    }
+    };
     let decode = decode_started.elapsed();
 
     Ok(Generated {
-        tokens,
-        text,
-        chunks,
-        reason,
-        completion_tokens: produced,
+        tokens: done.tokens,
+        text: done.text,
+        chunks: done.chunks,
+        reason: done.reason,
+        completion_tokens: done.completion_tokens,
         prefill,
         decode,
     })

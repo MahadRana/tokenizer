@@ -214,6 +214,109 @@ fn cached_decode_is_at_least_5x_uncached() {
     );
 }
 
+/// Eight prompts of different lengths. Greedy tokens from one decode batch
+/// match `generate` on each prompt alone. Prefill is still per sequence.
+#[test]
+#[ignore = "downloads Qwen2.5-0.5B-Instruct and runs a batched CPU decode"]
+fn batched_outputs_equal_solo_outputs() {
+    let (model, tok, _meta) = load_qwen();
+    let texts = [
+        "The capital of France is",
+        "The capital of France is Paris",
+        "Hello",
+        "Hello there",
+        "A",
+        "Say hi",
+        "The capital of France is the city",
+        "One",
+    ];
+    let prompts: Vec<Vec<u32>> = texts.iter().map(|text| tok.encode(text).unwrap()).collect();
+    let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    assert!(
+        lens.iter().copied().max() != lens.iter().copied().min(),
+        "prompts should differ in length, got {lens:?}"
+    );
+    let steps = 4usize;
+    let mut batch_caches: Vec<qwen_infer::KvCache> = (0..prompts.len())
+        .map(|_| qwen_infer::KvCache::new(model.num_layers()))
+        .collect();
+    let mut solo_caches: Vec<qwen_infer::KvCache> = (0..prompts.len())
+        .map(|_| qwen_infer::KvCache::new(model.num_layers()))
+        .collect();
+    let mut batch_rows = Vec::new();
+    let mut solo_rows = Vec::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        batch_rows.push(
+            model
+                .forward(prompt, 0, &mut batch_caches[index])
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+        );
+        solo_rows.push(
+            model
+                .forward(prompt, 0, &mut solo_caches[index])
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+        );
+    }
+    let mut generated = vec![Vec::new(); prompts.len()];
+    let mut worst = 0.0f32;
+    for step in 0..steps {
+        let mut next = Vec::with_capacity(prompts.len());
+        for index in 0..prompts.len() {
+            let id = qwen_infer::greedy_token(&batch_rows[index]).unwrap();
+            assert_eq!(id, qwen_infer::greedy_token(&solo_rows[index]).unwrap());
+            generated[index].push(id);
+            next.push(id);
+        }
+        if step + 1 == steps {
+            break;
+        }
+        let mut refs: Vec<&mut qwen_infer::KvCache> = batch_caches.iter_mut().collect();
+        let batched = model
+            .forward_decode_batch(&next, &mut refs)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        drop(refs);
+        for (index, id) in next.iter().copied().enumerate() {
+            let solo = model
+                .forward(&[id], solo_caches[index].seq_len(), &mut solo_caches[index])
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let diff = batched[index]
+                .iter()
+                .zip(&solo)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0.0f32, f32::max);
+            if diff > worst {
+                worst = diff;
+            }
+            assert!(
+                diff <= 1e-3,
+                "step {step} seq {index} max abs {diff} (len {})",
+                lens[index]
+            );
+            batch_rows[index] = batched[index].clone();
+            solo_rows[index] = solo;
+        }
+    }
+    eprintln!("real-weight batched vs solo max abs logit {worst}");
+    let params = qwen_infer::GenerateParams::greedy(steps);
+    for (index, prompt) in prompts.iter().enumerate() {
+        let alone =
+            qwen_infer::generate(&model, prompt, &params, |id| tok.decode_bytes(&[id])).unwrap();
+        assert_eq!(
+            generated[index], alone.tokens,
+            "prompt {} ({:?})",
+            texts[index], lens[index]
+        );
+    }
+}
+
 fn load_qwen() -> (qwen_infer::QwenModel, tokenizer::RankTokenizer, Meta) {
     let files = qwen_infer::download_qwen().expect("hf-hub download");
     let tokenizer_path = files.tokenizer.to_str().expect("tokenizer path is utf-8");

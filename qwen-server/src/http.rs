@@ -566,17 +566,10 @@ impl Stream for CompletionSse {
                 )))))
             }
             Poll::Ready(Some(GenUpdate::Failed(message))) => {
-                this.pending.push_back(Event::default().data("[DONE]"));
+                let (body, done) = failure_frame(&message);
+                this.pending.push_back(Event::default().data(done));
                 this.phase = Phase::Done;
-                let body = serde_json::json!({
-                    "error": {
-                        "message": message,
-                        "type": "server_error",
-                        "param": null,
-                        "code": null
-                    }
-                });
-                Poll::Ready(Some(Ok(Event::default().data(body.to_string()))))
+                Poll::Ready(Some(Ok(Event::default().data(body))))
             }
         }
     }
@@ -652,11 +645,58 @@ fn chunk_usage(id: &str, created: u64, prompt_tokens: u32, completion_tokens: u3
     }
 }
 
+/// SSE payload for a generation failure, then the terminator the stream
+/// queues behind it. One `GenUpdate::Failed` is this JSON event and then
+/// `[DONE]`. The engine must deliver that update; dropping the sender
+/// instead ends the stream on EOF.
+pub(crate) fn failure_frame(message: &str) -> (String, &'static str) {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "param": null,
+            "code": null
+        }
+    });
+    (body.to_string(), "[DONE]")
+}
+
 fn event_json(value: &impl Serialize) -> Event {
     match Event::default().json_data(value) {
         Ok(event) => event,
         Err(err) => Event::default().data(format!(
             "{{\"error\":{{\"message\":\"failed to encode SSE chunk: {err}\",\"type\":\"server_error\",\"param\":null,\"code\":null}}}}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn failed_update_is_an_error_event_then_done() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(GenUpdate::Failed("forward exploded".into()))
+            .unwrap();
+        drop(tx);
+        let sse = CompletionSse {
+            inner: ReceiverStream::new(rx),
+            pending: VecDeque::new(),
+            phase: Phase::Role,
+            id: "chatcmpl-test".into(),
+            created: 1,
+            include_usage: false,
+        };
+        let response = Sse::new(sse).into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("sse body");
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let error_at = text.find("server_error").expect(&text);
+        let done_at = text.find("[DONE]").expect(&text);
+        assert!(error_at < done_at, "{text}");
+        assert!(text.contains("forward exploded"), "{text}");
     }
 }

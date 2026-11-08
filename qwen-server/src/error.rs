@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
@@ -47,6 +48,30 @@ impl ApiError {
             param: None,
             code: None,
         }
+    }
+
+    /// Batch or waiting-queue capacity is exhausted.
+    ///
+    /// OpenAI's error guide (fetched 2026-11-08) uses HTTP 429 with
+    /// `type: rate_limit_error` for "slow down", and the error object still
+    /// carries `message`, `type`, `param`, and `code`. `rate_limit_exceeded`
+    /// is the code on that object when the limit is a request cap.
+    /// <https://platform.openai.com/docs/guides/error-codes>
+    pub fn too_many(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            kind: "rate_limit_error",
+            param: None,
+            code: Some("rate_limit_exceeded".to_string()),
+        }
+    }
+
+    /// Status the HTTP layer will send. Unit tests read this. The binary
+    /// itself only goes through [`IntoResponse`].
+    #[cfg(test)]
+    pub fn status(&self) -> StatusCode {
+        self.status
     }
 
     pub fn from_rejection(err: JsonRejection) -> Self {
