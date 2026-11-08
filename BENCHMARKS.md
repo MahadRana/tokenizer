@@ -36,3 +36,17 @@ Measured 2026-11-01 on commit `15f5bc2b00ec2fe25cab90ac24788f31f8a2f6ff`, same h
 ## A3: cl100k vocab round trip
 
 Not the training command. `decode_encode_piece_round_trips_every_vocab_entry` encodes every mergeable cl100k token and checks `decode_bytes` returns those bytes. Two release runs on 2026-11-01, rustc 1.99.1 (58cf8f9c3 2026-10-13), same machine as the A2 rows: **53.056 ms** and **53.227 ms** for 100,256 tokens. Debug on the test profile was 337 ms. The test fails the run if release exceeds 1 s. These are two clock readings, not a hyperfine mean.
+
+A release run on 2026-11-02, same machine and the same rustc, printed **59.284 ms**. The timer starts after `load_cl100k` returns, so the new regex compile is not in that number. The piece scan is unchanged. Still under the 1 s budget. Three readings (53.056, 53.227, 59.284 ms) are not a mean.
+
+## A4: cl100k encode throughput on the book
+
+Not the training command. `cargo bench --bench cl100k_encode` encodes Pride and Prejudice with `RankTokenizer::encode` (specials allowed, cl100k regex, then piece BPE). The vocab is the cached `cl100k_base.tiktoken`. Criterion 0.8.2, `Throughput::Bytes` of the file length.
+
+Measured 2026-11-02, rustc 1.99.1 (58cf8f9c3 2026-10-13), same machine as the rows above (Linux 6.12.94+ x86_64, 4 vCPUs, Intel Xeon family 6 model 207, MemTotal 16,387,280 kB). 100 samples. Criterion warned that 100 samples wanted about 7.2 s and then collected them.
+
+| | time | throughput |
+|---|---|---|
+| `cl100k_encode/book` | **73.636 ms** (72.820–74.501 ms) | **10.003 MiB/s** (9.8872–10.115 MiB/s) |
+
+772,386 bytes / 0.073636 s = **10.49 MB/s** using 10^6 bytes per MB. Criterion's MiB is 2^20. The file encodes to 177,179 tokens (`encode_matches_tiktoken_on_book`, release), 4.36 bytes/token. Gnuplot was not installed; criterion used the plotters backend. The number is one criterion estimate, not a hyperfine mean of the training binary.

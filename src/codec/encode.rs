@@ -8,13 +8,13 @@ pub fn encode(text: &str, encoder: &HashMap<(u32, u32), u32>) -> Vec<u32> {
         return seq;
     }
 
-    let mut found = true; 
+    let mut found = true;
     while found {
         found = false;
-        let mut min_pair = (u32::MAX,u32::MAX);
+        let mut min_pair = (u32::MAX, u32::MAX);
         let mut min_id = u32::MAX;
-        for i in 0..seq.len()-1 {
-            let pair = (seq[i], seq[i+1]);
+        for i in 0..seq.len() - 1 {
+            let pair = (seq[i], seq[i + 1]);
             if encoder.contains_key(&pair) {
                 found = true;
                 let id = encoder[&pair];
