@@ -1,0 +1,20 @@
+[build-system]
+# maturin 1.16.0 (crates.io, 2026-10-29). 1.x is the stable line.
+requires = ["maturin>=1.16,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mahad-tok"
+description = "Python bindings for a cl100k_base byte-pair encoder"
+requires-python = ">=3.9"
+license = "MIT"
+dynamic = ["version"]
+
+[tool.maturin]
+# The workspace root is the core crate. Point maturin at the cdylib.
+manifest-path = "tokenizer-py/Cargo.toml"
+module-name = "mahad_tok"
+bindings = "pyo3"
+# Links the extension against Python's stable ABI symbols at import time,
+# not against libpython while linking the wheel.
+features = ["extension-module"]

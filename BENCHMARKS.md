@@ -63,3 +63,57 @@ Not the training command. Same machine as the rows above (Linux 6.12.94+ x86_64,
 | Python tiktoken 0.14.0 on 10 Gutenberg files | **10,610,901** bytes, **0** diffs |
 
 `PROPTEST_CASES=20` on the round-trip property finished in 0.19 s, and `PROPTEST_CASES=10000` finished in 1.71 s, which is the unset default. CI runs the 10,000-case default. These are single harness readings, not hyperfine means.
+
+## A6: Python bindings vs tiktoken 0.14.0
+
+Not the training command. `scripts/bench_vs_tiktoken.py` times `mahad_tok.Encoding.encode` on the whole string, then `encode_batch` at 1, 4, and 8 threads. tiktoken 0.14.0 is called the same way, with `allowed_special="all"`. The script checks token ids against tiktoken before it starts the clock (book: 177,179 tokens, the same count as the A4 book test; corpus: 36,411,860 tokens). A mismatch would have exited. None did.
+
+MB/s is bytes / 1e6 / seconds, the decimal megabyte used in the A4 note. The ratio column is wall time, ours divided by tiktoken. 1.0× is a tie. Above 1 means tiktoken finished sooner. Batch rows split the same text into chunks of 32,768 Python characters (24 chunks on the book, 2,631 on the corpus). A chunk boundary is a hard cut, so those rows are not the same work as one `encode` of the whole string. Means of 5 samples on the book and 2 on the corpus.
+
+The corpus is `bench-corpus.txt` (gitignored), 106,109,010 bytes. `scripts/gen_bench_corpus.py` downloaded the ten Gutenberg files from the A5 cross-check (10,610,901 bytes, the same total A5 recorded), concatenated them, and repeated that blob until it passed 100,000,000 bytes. Ten copies is 106,109,010. The files are not committed.
+
+Measured 2026-11-04, rustc 1.99.1 (58cf8f9c3 2026-10-13), Python 3.12.3, maturin 1.16.0, PyO3 0.30.1, rayon 1.12.0, tiktoken 0.14.0. Same machine as the rows above.
+
+- Linux 6.12.94+ x86_64, KVM guest
+- 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores.
+- MemTotal 16,387,280 kB
+
+This machine has 4 logical CPUs, fewer than 8. The 8-thread rows were still run. They oversubscribe the cores. On the book, 8 threads is slower than 4. On the corpus, 8 and 4 are about the same, and both are faster than 1.
+
+### Book (772,386 bytes)
+
+| | mahad_tok | tiktoken 0.14.0 | time ratio |
+|---|---|---|---|
+| single-thread | **10.800 MB/s** (0.072 s) | **20.150 MB/s** (0.038 s) | **1.866×** |
+| batch, 1 thread | 10.704 MB/s (0.072 s) | 14.957 MB/s (0.052 s) | 1.397× |
+| batch, 4 threads | 31.374 MB/s (0.025 s) | 49.890 MB/s (0.015 s) | 1.590× |
+| batch, 8 threads | 27.430 MB/s (0.028 s) | 36.846 MB/s (0.021 s) | 1.343× |
+
+Book samples, seconds. Ours then tiktoken.
+
+- single-thread: 0.0715, 0.0714, 0.0718, 0.0717, 0.0713 and 0.0394, 0.0380, 0.0382, 0.0380, 0.0381
+- batch 1: 0.0732, 0.0721, 0.0720, 0.0719, 0.0715 and 0.0531, 0.0521, 0.0508, 0.0512, 0.0510
+- batch 4: 0.0246, 0.0243, 0.0249, 0.0243, 0.0250 and 0.0158, 0.0151, 0.0151, 0.0158, 0.0156
+- batch 8: 0.0287, 0.0252, 0.0288, 0.0306, 0.0275 and 0.0198, 0.0238, 0.0200, 0.0214, 0.0198
+
+Single-thread on the book is **1.87×** tiktoken's time. That misses the 1.5× target. The A4 criterion loop on this file, same machine and the same rustc, was 10.49 MB/s. The Python `encode` is 10.80 MB/s, so the binding is not where the time went. tiktoken's encoder is faster on this text. 8 threads still beats the 1-thread batch (0.028 s vs 0.072 s).
+
+### 100 MB corpus (106,109,010 bytes)
+
+| | mahad_tok | tiktoken 0.14.0 | time ratio |
+|---|---|---|---|
+| single-thread | **8.523 MB/s** (12.449 s) | **11.277 MB/s** (9.410 s) | **1.323×** |
+| batch, 1 thread | 6.873 MB/s (15.439 s) | 9.150 MB/s (11.597 s) | 1.331× |
+| batch, 4 threads | 22.802 MB/s (4.654 s) | 28.838 MB/s (3.679 s) | 1.265× |
+| batch, 8 threads | 23.206 MB/s (4.573 s) | 23.339 MB/s (4.546 s) | 1.006× |
+
+Corpus samples, seconds. Ours then tiktoken. Two samples, so this is a mean of a short run, not a hyperfine σ.
+
+- single-thread: 11.5335, 13.3654 and 9.4981, 9.3211
+- batch 1: 15.8578, 15.0196 and 12.6839, 10.5101
+- batch 4: 4.7939, 4.5132 and 3.0548, 4.3040
+- batch 8: 4.6754, 4.4697 and 4.3611, 4.7316
+
+Single-thread on the corpus is **1.32×** tiktoken's time, inside the 1.5× target. The two ours samples differ by about 1.8 s, so the ratio is coarser than the book row. 8 threads is 15.439 / 4.573 = **3.4×** the 1-thread batch. It does not beat 4 threads by a meaningful amount: there are only 4 cores.
+
+A separate pytest on a synthetic list (64 copies of a ~60 KB sentence, minimum of 3 runs) measured `encode_batch(..., num_threads=8)` at 0.124 s, the 1-thread batch at 0.302 s, and a Python loop of `encode` at 0.293 s. A watcher thread recorded 33 GIL acquisitions during a 0.400 s `encode_batch` (`time.sleep(0.01)` in that thread). Those are one pytest run, not the tables above.
