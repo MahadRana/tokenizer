@@ -1,0 +1,293 @@
+{"text": "'s", "specials": "all", "ids": [596]}
+{"text": "'S", "specials": "all", "ids": [13575]}
+{"text": "'t", "specials": "all", "ids": [956]}
+{"text": "'T", "specials": "all", "ids": [17773]}
+{"text": "'re", "specials": "all", "ids": [2351]}
+{"text": "'RE", "specials": "all", "ids": [95253]}
+{"text": "'ve", "specials": "all", "ids": [3077]}
+{"text": "'VE", "specials": "all", "ids": [6, 4592]}
+{"text": "'m", "specials": "all", "ids": [2846]}
+{"text": "'M", "specials": "all", "ids": [28703]}
+{"text": "'ll", "specials": "all", "ids": [3358]}
+{"text": "'LL", "specials": "all", "ids": [6, 4178]}
+{"text": "'d", "specials": "all", "ids": [4265]}
+{"text": "'D", "specials": "all", "ids": [28805]}
+{"text": "it's", "specials": "all", "ids": [275, 596]}
+{"text": "It's", "specials": "all", "ids": [2181, 596]}
+{"text": "IT'S", "specials": "all", "ids": [964, 13575]}
+{"text": "that's", "specials": "all", "ids": [9210, 596]}
+{"text": "John's", "specials": "all", "ids": [13379, 596]}
+{"text": "don't", "specials": "all", "ids": [15357, 956]}
+{"text": "Don't", "specials": "all", "ids": [8161, 956]}
+{"text": "can't", "specials": "all", "ids": [4919, 956]}
+{"text": "won't", "specials": "all", "ids": [55767, 956]}
+{"text": "I'll", "specials": "all", "ids": [40, 3358]}
+{"text": "we'll", "specials": "all", "ids": [906, 3358]}
+{"text": "they'll", "specials": "all", "ids": [20670, 3358]}
+{"text": "I'LL", "specials": "all", "ids": [40, 6, 4178]}
+{"text": "we'll go", "specials": "all", "ids": [906, 3358, 733]}
+{"text": "I've", "specials": "all", "ids": [40, 3077]}
+{"text": "you've", "specials": "all", "ids": [9514, 3077]}
+{"text": "they've", "specials": "all", "ids": [20670, 3077]}
+{"text": "I'm", "specials": "all", "ids": [40, 2846]}
+{"text": "you're", "specials": "all", "ids": [9514, 2351]}
+{"text": "we're", "specials": "all", "ids": [906, 2351]}
+{"text": "I'd", "specials": "all", "ids": [40, 4265]}
+{"text": "you'd", "specials": "all", "ids": [9514, 4265]}
+{"text": "we'd", "specials": "all", "ids": [906, 4265]}
+{"text": "it's John's book and he'll read it", "specials": "all", "ids": [275, 596, 3842, 596, 2363, 323, 568, 3358, 1373, 433]}
+{"text": "the dog's bone", "specials": "all", "ids": [1820, 5679, 596, 17685]}
+{"text": "friends'", "specials": "all", "ids": [30562, 6]}
+{"text": "rock 'n' roll", "specials": "all", "ids": [21161, 364, 77, 6, 6638]}
+{"text": "y'all", "specials": "all", "ids": [88, 65948]}
+{"text": "''s", "specials": "all", "ids": [4708, 82]}
+{"text": " ", "specials": "all", "ids": [220]}
+{"text": "\t", "specials": "all", "ids": [197]}
+{"text": "\n", "specials": "all", "ids": [198]}
+{"text": "\r\n", "specials": "all", "ids": [319]}
+{"text": "  ", "specials": "all", "ids": [256]}
+{"text": "\t\t", "specials": "all", "ids": [298]}
+{"text": "\n\n", "specials": "all", "ids": [271]}
+{"text": "\r\n\r\n", "specials": "all", "ids": [881]}
+{"text": "   ", "specials": "all", "ids": [262]}
+{"text": "\t\t\t", "specials": "all", "ids": [573]}
+{"text": "\n\n\n", "specials": "all", "ids": [1432]}
+{"text": "\r\n\r\n\r\n", "specials": "all", "ids": [8731]}
+{"text": "    ", "specials": "all", "ids": [257]}
+{"text": "\t\t\t\t", "specials": "all", "ids": [465]}
+{"text": "\n\n\n\n", "specials": "all", "ids": [1038]}
+{"text": "\r\n\r\n\r\n\r\n", "specials": "all", "ids": [27333]}
+{"text": "     ", "specials": "all", "ids": [415]}
+{"text": "\t\t\t\t\t", "specials": "all", "ids": [1164]}
+{"text": "\n\n\n\n\n", "specials": "all", "ids": [14963]}
+{"text": "\r\n\r\n\r\n\r\n\r\n", "specials": "all", "ids": [881, 8731]}
+{"text": "      ", "specials": "all", "ids": [996]}
+{"text": "\t\t\t\t\t\t", "specials": "all", "ids": [1696]}
+{"text": "\n\n\n\n\n\n", "specials": "all", "ids": [5244]}
+{"text": "\r\n\r\n\r\n\r\n\r\n\r\n", "specials": "all", "ids": [27333, 881]}
+{"text": "       ", "specials": "all", "ids": [286]}
+{"text": "\t\t\t\t\t\t\t", "specials": "all", "ids": [2750]}
+{"text": "\n\n\n\n\n\n\n", "specials": "all", "ids": [35683]}
+{"text": "\r\n\r\n\r\n\r\n\r\n\r\n\r\n", "specials": "all", "ids": [27333, 8731]}
+{"text": "        ", "specials": "all", "ids": [260]}
+{"text": "\t\t\t\t\t\t\t\t", "specials": "all", "ids": [2236]}
+{"text": "\n\n\n\n\n\n\n\n", "specials": "all", "ids": [6087]}
+{"text": "\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n", "specials": "all", "ids": [27333, 27333]}
+{"text": "\r", "specials": "all", "ids": [201]}
+{"text": "\r\r", "specials": "all", "ids": [201, 201]}
+{"text": "\n\r", "specials": "all", "ids": [198, 201]}
+{"text": "\n\r\n", "specials": "all", "ids": [198, 319]}
+{"text": " \t", "specials": "all", "ids": [7163]}
+{"text": "\t ", "specials": "all", "ids": [3762]}
+{"text": " \n", "specials": "all", "ids": [720]}
+{"text": "\n ", "specials": "all", "ids": [198, 220]}
+{"text": "\t\n", "specials": "all", "ids": [1602]}
+{"text": "\n\t", "specials": "all", "ids": [198, 197]}
+{"text": "a b", "specials": "all", "ids": [64, 293]}
+{"text": "a  b", "specials": "all", "ids": [64, 220, 293]}
+{"text": "a   b", "specials": "all", "ids": [64, 256, 293]}
+{"text": "a\tb", "specials": "all", "ids": [64, 2282]}
+{"text": "a\t\tb", "specials": "all", "ids": [64, 197, 2282]}
+{"text": "a\nb", "specials": "all", "ids": [64, 198, 65]}
+{"text": "a\n\nb", "specials": "all", "ids": [64, 271, 65]}
+{"text": "a\r\nb", "specials": "all", "ids": [64, 319, 65]}
+{"text": "hello\r\nworld", "specials": "all", "ids": [15339, 319, 14957]}
+{"text": "hello   ", "specials": "all", "ids": [15339, 262]}
+{"text": "   hello", "specials": "all", "ids": [256, 24748]}
+{"text": " \n \n ", "specials": "all", "ids": [33006, 220]}
+{"text": "end of line \n", "specials": "all", "ids": [408, 315, 1584, 720]}
+{"text": "trailing spaces   \n", "specials": "all", "ids": [376, 14612, 12908, 5996]}
+{"text": "mix \t\r\n\t end", "specials": "all", "ids": [36171, 220, 4574, 197, 842]}
+{"text": " ", "specials": "all", "ids": [4194]}
+{"text": "a b", "specials": "all", "ids": [64, 4194, 65]}
+{"text": "line1\r\nline2\r\n", "specials": "all", "ids": [1074, 16, 319, 1074, 17, 319]}
+{"text": "0", "specials": "all", "ids": [15]}
+{"text": "1", "specials": "all", "ids": [16]}
+{"text": "2", "specials": "all", "ids": [17]}
+{"text": "3", "specials": "all", "ids": [18]}
+{"text": "4", "specials": "all", "ids": [19]}
+{"text": "5", "specials": "all", "ids": [20]}
+{"text": "6", "specials": "all", "ids": [21]}
+{"text": "7", "specials": "all", "ids": [22]}
+{"text": "8", "specials": "all", "ids": [23]}
+{"text": "9", "specials": "all", "ids": [24]}
+{"text": "10", "specials": "all", "ids": [605]}
+{"text": "11", "specials": "all", "ids": [806]}
+{"text": "12", "specials": "all", "ids": [717]}
+{"text": "13", "specials": "all", "ids": [1032]}
+{"text": "14", "specials": "all", "ids": [975]}
+{"text": "15", "specials": "all", "ids": [868]}
+{"text": "16", "specials": "all", "ids": [845]}
+{"text": "17", "specials": "all", "ids": [1114]}
+{"text": "18", "specials": "all", "ids": [972]}
+{"text": "19", "specials": "all", "ids": [777]}
+{"text": "20", "specials": "all", "ids": [508]}
+{"text": "21", "specials": "all", "ids": [1691]}
+{"text": "22", "specials": "all", "ids": [1313]}
+{"text": "23", "specials": "all", "ids": [1419]}
+{"text": "24", "specials": "all", "ids": [1187]}
+{"text": "25", "specials": "all", "ids": [914]}
+{"text": "26", "specials": "all", "ids": [1627]}
+{"text": "27", "specials": "all", "ids": [1544]}
+{"text": "28", "specials": "all", "ids": [1591]}
+{"text": "29", "specials": "all", "ids": [1682]}
+{"text": "30", "specials": "all", "ids": [966]}
+{"text": "31", "specials": "all", "ids": [2148]}
+{"text": "32", "specials": "all", "ids": [843]}
+{"text": "33", "specials": "all", "ids": [1644]}
+{"text": "34", "specials": "all", "ids": [1958]}
+{"text": "35", "specials": "all", "ids": [1758]}
+{"text": "36", "specials": "all", "ids": [1927]}
+{"text": "37", "specials": "all", "ids": [1806]}
+{"text": "38", "specials": "all", "ids": [1987]}
+{"text": "39", "specials": "all", "ids": [2137]}
+{"text": "99", "specials": "all", "ids": [1484]}
+{"text": "100", "specials": "all", "ids": [1041]}
+{"text": "101", "specials": "all", "ids": [4645]}
+{"text": "999", "specials": "all", "ids": [5500]}
+{"text": "1000", "specials": "all", "ids": [1041, 15]}
+{"text": "1001", "specials": "all", "ids": [1041, 16]}
+{"text": "12345", "specials": "all", "ids": [4513, 1774]}
+{"text": "123456", "specials": "all", "ids": [4513, 10961]}
+{"text": "123456789", "specials": "all", "ids": [4513, 10961, 16474]}
+{"text": "123456789012", "specials": "all", "ids": [4513, 10961, 16474, 11531]}
+{"text": "123", "specials": "all", "ids": [4513]}
+{"text": "1234", "specials": "all", "ids": [4513, 19]}
+{"text": "999999", "specials": "all", "ids": [5500, 5500]}
+{"text": "000", "specials": "all", "ids": [931]}
+{"text": "0000", "specials": "all", "ids": [931, 15]}
+{"text": "00000", "specials": "all", "ids": [931, 410]}
+{"text": "12345 678 9 00000", "specials": "all", "ids": [4513, 1774, 220, 17458, 220, 24, 220, 931, 410]}
+{"text": "id=12345", "specials": "all", "ids": [307, 28, 4513, 1774]}
+{"text": "abc12345def", "specials": "all", "ids": [13997, 4513, 1774, 755]}
+{"text": " 12345", "specials": "all", "ids": [220, 4513, 1774]}
+{"text": "12345 ", "specials": "all", "ids": [4513, 1774, 220]}
+{"text": "price 12345", "specials": "all", "ids": [6692, 220, 4513, 1774]}
+{"text": "🦀", "specials": "all", "ids": [9468, 99, 222]}
+{"text": "🙂", "specials": "all", "ids": [9468, 19044]}
+{"text": "😀", "specials": "all", "ids": [76460, 222]}
+{"text": "👍", "specials": "all", "ids": [9468, 239, 235]}
+{"text": "👍🏻", "specials": "all", "ids": [9468, 239, 235, 9468, 237, 119]}
+{"text": "👨‍👩‍👧‍👦", "specials": "all", "ids": [9468, 239, 101, 378, 235, 9468, 239, 102, 378, 235, 9468, 239, 100, 378, 235, 9468, 239, 99]}
+{"text": "🇺🇸", "specials": "all", "ids": [9468, 229, 118, 9468, 229, 116]}
+{"text": "🏳️‍🌈", "specials": "all", "ids": [9468, 237, 111, 31643, 378, 235, 9468, 234, 230]}
+{"text": "👩‍💻", "specials": "all", "ids": [9468, 239, 102, 378, 235, 93273, 119]}
+{"text": "hello 🦀", "specials": "all", "ids": [15339, 11410, 99, 222]}
+{"text": "🦀🦀", "specials": "all", "ids": [9468, 99, 222, 9468, 99, 222]}
+{"text": "a🙂b", "specials": "all", "ids": [64, 9468, 19044, 65]}
+{"text": "‍", "specials": "all", "ids": [378, 235]}
+{"text": "☺️", "specials": "all", "ids": [18107, 118, 31643]}
+{"text": "1️⃣", "specials": "all", "ids": [16, 31643, 158, 225, 96]}
+{"text": "🇯🇵", "specials": "all", "ids": [9468, 229, 107, 9468, 229, 113]}
+{"text": "é🙂", "specials": "all", "ids": [68, 54939, 9468, 19044]}
+{"text": "日本語", "specials": "all", "ids": [9080, 22656, 45918, 252]}
+{"text": "你好", "specials": "all", "ids": [57668, 53901]}
+{"text": "こんにちは", "specials": "all", "ids": [90115]}
+{"text": "한국어", "specials": "all", "ids": [24486, 89059, 255, 32179]}
+{"text": "中文", "specials": "all", "ids": [16325, 17161]}
+{"text": "漢字", "specials": "all", "ids": [78256, 95, 19113]}
+{"text": "カタカナ", "specials": "all", "ids": [71493, 47307, 71493, 96452]}
+{"text": "ひらがな", "specials": "all", "ids": [2243, 110, 33503, 29295, 26854]}
+{"text": "hello日本語", "specials": "all", "ids": [15339, 9080, 22656, 45918, 252]}
+{"text": "日本語hello", "specials": "all", "ids": [9080, 22656, 45918, 252, 15339]}
+{"text": "价格是123元", "specials": "all", "ids": [98580, 21043, 4513, 24186]}
+{"text": "你好，世界", "specials": "all", "ids": [57668, 53901, 3922, 3574, 244, 98220]}
+{"text": "こんにちは世界", "specials": "all", "ids": [90115, 3574, 244, 98220]}
+{"text": "「こんにちは」", "specials": "all", "ids": [13177, 90115, 10646]}
+{"text": "《中文》", "specials": "all", "ids": [28038, 16325, 17161, 26123]}
+{"text": "가나다", "specials": "all", "ids": [20565, 61415, 13447]}
+{"text": "한글", "specials": "all", "ids": [24486, 84391]}
+{"text": "中文\n日本語", "specials": "all", "ids": [16325, 17161, 198, 9080, 22656, 45918, 252]}
+{"text": "ＡＢＣ１２３", "specials": "all", "ids": [1569, 94, 1569, 95, 1569, 96, 20713, 25963, 34617]}
+{"text": "é", "specials": "all", "ids": [68, 54939]}
+{"text": "à", "specials": "all", "ids": [64, 97649]}
+{"text": "ñ", "specials": "all", "ids": [77, 136, 225]}
+{"text": "ö", "specials": "all", "ids": [78, 136, 230]}
+{"text": "ç", "specials": "all", "ids": [66, 136, 100]}
+{"text": "café", "specials": "all", "ids": [936, 59958]}
+{"text": "café", "specials": "all", "ids": [936, 1897, 54939]}
+{"text": "é́", "specials": "all", "ids": [68, 54939, 54939]}
+{"text": "Å", "specials": "all", "ids": [32, 136, 232]}
+{"text": "öe", "specials": "all", "ids": [78, 136, 230, 68]}
+{"text": "näive", "specials": "all", "ids": [3458, 136, 230, 535]}
+{"text": "Ž", "specials": "all", "ids": [57, 136, 234]}
+{"text": "äb̃ç", "specials": "all", "ids": [64, 136, 230, 65, 136, 225, 66, 136, 100]}
+{"text": "́", "specials": "all", "ids": [54939]}
+{"text": "é\n", "specials": "all", "ids": [68, 54939, 198]}
+{"text": "", "specials": "all", "ids": []}
+{"text": "a", "specials": "all", "ids": [64]}
+{"text": "hello", "specials": "all", "ids": [15339]}
+{"text": " world", "specials": "all", "ids": [1917]}
+{"text": "hello world", "specials": "all", "ids": [15339, 1917]}
+{"text": "Hello, world!", "specials": "all", "ids": [9906, 11, 1917, 0]}
+{"text": "The quick brown fox jumps over the lazy dog.", "specials": "all", "ids": [791, 4062, 14198, 39935, 35308, 927, 279, 16053, 5679, 13]}
+{"text": "  hello", "specials": "all", "ids": [220, 24748]}
+{"text": "tokenization", "specials": "all", "ids": [5963, 2065]}
+{"text": "ABC", "specials": "all", "ids": [26484]}
+{"text": "...", "specials": "all", "ids": [1131]}
+{"text": "aaaaaaaa", "specials": "all", "ids": [70540]}
+{"text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "specials": "all", "ids": [70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540]}
+{"text": "fn main() { println!(\"hi\"); }", "specials": "all", "ids": [8998, 1925, 368, 314, 14069, 17667, 6151, 5146, 335]}
+{"text": "https://example.com/a?b=1&c=2", "specials": "all", "ids": [2485, 1129, 8858, 916, 14520, 30, 65, 28, 16, 5, 66, 28, 17]}
+{"text": "user@example.com", "specials": "all", "ids": [882, 36587, 916]}
+{"text": "price is $12.50, or 12,50 €", "specials": "all", "ids": [6692, 374, 400, 717, 13, 1135, 11, 477, 220, 717, 11, 1135, 13281]}
+{"text": "1 + 2 = 3", "specials": "all", "ids": [16, 489, 220, 17, 284, 220, 18]}
+{"text": "foo\tbar\tbaz", "specials": "all", "ids": [8134, 91809, 2282, 1394]}
+{"text": "line1\nline2\nline3", "specials": "all", "ids": [1074, 16, 198, 1074, 17, 198, 1074, 18]}
+{"text": "\"quotes\"", "specials": "all", "ids": [1, 54382, 1]}
+{"text": "it's a test of 'LL and 's", "specials": "all", "ids": [275, 596, 264, 1296, 315, 364, 4178, 323, 364, 82]}
+{"text": "🙂日本語", "specials": "all", "ids": [9468, 19044, 9080, 22656, 45918, 252]}
+{"text": "  \n\t12345  ", "specials": "all", "ids": [2355, 197, 4513, 1774, 256]}
+{"text": "Mr. Bennet", "specials": "all", "ids": [12555, 13, 30880, 295]}
+{"text": "café déjà", "specials": "all", "ids": [936, 59958, 46939]}
+{"text": "<|endoftext|>", "specials": "all", "ids": [100257]}
+{"text": "hello <|endoftext|> world", "specials": "all", "ids": [15339, 220, 100257, 1917]}
+{"text": "<|endoftext|>", "specials": ["<|endoftext|>"], "ids": [100257]}
+{"text": "<|endoftext|>", "specials": [], "disallowed": "<|endoftext|>"}
+{"text": "before <|endoftext|> after", "specials": ["<|endoftext|>"], "ids": [15145, 220, 100257, 1306]}
+{"text": "before <|endoftext|> after", "specials": [], "disallowed": "<|endoftext|>"}
+{"text": "<|fim_prefix|>", "specials": "all", "ids": [100258]}
+{"text": "hello <|fim_prefix|> world", "specials": "all", "ids": [15339, 220, 100258, 1917]}
+{"text": "<|fim_prefix|>", "specials": ["<|fim_prefix|>"], "ids": [100258]}
+{"text": "<|fim_prefix|>", "specials": [], "disallowed": "<|fim_prefix|>"}
+{"text": "before <|fim_prefix|> after", "specials": ["<|fim_prefix|>"], "ids": [15145, 220, 100258, 1306]}
+{"text": "before <|fim_prefix|> after", "specials": [], "disallowed": "<|fim_prefix|>"}
+{"text": "<|fim_middle|>", "specials": "all", "ids": [100259]}
+{"text": "hello <|fim_middle|> world", "specials": "all", "ids": [15339, 220, 100259, 1917]}
+{"text": "<|fim_middle|>", "specials": ["<|fim_middle|>"], "ids": [100259]}
+{"text": "<|fim_middle|>", "specials": [], "disallowed": "<|fim_middle|>"}
+{"text": "before <|fim_middle|> after", "specials": ["<|fim_middle|>"], "ids": [15145, 220, 100259, 1306]}
+{"text": "before <|fim_middle|> after", "specials": [], "disallowed": "<|fim_middle|>"}
+{"text": "<|fim_suffix|>", "specials": "all", "ids": [100260]}
+{"text": "hello <|fim_suffix|> world", "specials": "all", "ids": [15339, 220, 100260, 1917]}
+{"text": "<|fim_suffix|>", "specials": ["<|fim_suffix|>"], "ids": [100260]}
+{"text": "<|fim_suffix|>", "specials": [], "disallowed": "<|fim_suffix|>"}
+{"text": "before <|fim_suffix|> after", "specials": ["<|fim_suffix|>"], "ids": [15145, 220, 100260, 1306]}
+{"text": "before <|fim_suffix|> after", "specials": [], "disallowed": "<|fim_suffix|>"}
+{"text": "<|endofprompt|>", "specials": "all", "ids": [100276]}
+{"text": "hello <|endofprompt|> world", "specials": "all", "ids": [15339, 220, 100276, 1917]}
+{"text": "<|endofprompt|>", "specials": ["<|endofprompt|>"], "ids": [100276]}
+{"text": "<|endofprompt|>", "specials": [], "disallowed": "<|endofprompt|>"}
+{"text": "before <|endofprompt|> after", "specials": ["<|endofprompt|>"], "ids": [15145, 220, 100276, 1306]}
+{"text": "before <|endofprompt|> after", "specials": [], "disallowed": "<|endofprompt|>"}
+{"text": "<|endoftext|><|fim_prefix|>", "specials": "all", "ids": [100257, 100258]}
+{"text": " <|endoftext|> <|fim_middle|> <|fim_suffix|> ", "specials": "all", "ids": [220, 100257, 220, 100259, 220, 100260, 220]}
+{"text": "<|endoftext|> <|endoftext|>", "specials": "all", "ids": [100257, 220, 100257]}
+{"text": "<|endoftext|> and <|fim_prefix|>", "specials": ["<|endoftext|>"], "disallowed": "<|fim_prefix|>"}
+{"text": "<|endoftext|> and <|fim_prefix|>", "specials": ["<|fim_prefix|>"], "disallowed": "<|endoftext|>"}
+{"text": "<|endoftext|> and <|fim_prefix|>", "specials": ["<|endoftext|>", "<|fim_prefix|>"], "ids": [100257, 323, 220, 100258]}
+{"text": "no specials here", "specials": [], "ids": [2201, 60874, 1618]}
+{"text": "no specials here", "specials": ["<|endoftext|>"], "ids": [2201, 60874, 1618]}
+{"text": "<|endoftext>", "specials": [], "ids": [27, 91, 8862, 728, 428, 29]}
+{"text": "<|endoftext>", "specials": "all", "ids": [27, 91, 8862, 728, 428, 29]}
+{"text": "endoftext", "specials": "all", "ids": [8862, 728, 428]}
+{"text": "x<|endoftext|>y<|fim_suffix|>z", "specials": ["<|endoftext|>"], "disallowed": "<|fim_suffix|>"}
+{"text": "x<|endoftext|>y<|fim_suffix|>z", "specials": ["<|endoftext|>", "<|fim_suffix|>"], "ids": [87, 100257, 88, 100260, 89]}
+{"text": "The Project Gutenberg eBook of Pride and Prejudice\r\n    \r\nThis eBook is for the use of anyone anywhere in the United States and\r\nmost other parts of the world at no cost and with a", "specials": "all", "ids": [791, 5907, 52686, 58610, 315, 43246, 323, 5075, 18631, 560, 34279, 2028, 58610, 374, 369, 279, 1005, 315, 5606, 12660, 304, 279, 3723, 4273, 323, 319, 3646, 1023, 5596, 315, 279, 1917, 520, 912, 2853, 323, 449, 264]}
+{"text": "stributed Proofreading Team at http://www.pgdp.net (This file was produced from images available at The Internet Archive)\r\n\r\n\r\n*** START OF THE PROJECT GUTENBERG EBOOK PRIDE AND PREJUDICE ***\r\n\r\n\r\n\r\n\r\n                            [Illustrati", "specials": "all", "ids": [267, 1936, 2844, 38091, 6285, 8068, 520, 1795, 1129, 2185, 87944, 9996, 5181, 320, 2028, 1052, 574, 9124, 505, 5448, 2561, 520, 578, 8191, 30802, 35016, 12488, 21673, 3083, 3247, 40992, 480, 1406, 965, 9745, 38, 469, 37725, 8743, 12420, 3651, 21626, 41, 4760, 5604, 17601, 881, 8731, 1014, 510, 97257, 9491]}
+{"text": "itting that\r\nEdmund only took Fanny because Mary shocked him, and that Fanny might\r\nvery likely have taken Crawford if he had been a little more assiduous;\r\nyet the matchless rehearsal-scenes and the characters of Mrs. Norris and\r\nothers have secured, I believe, a considerable party for it._ Sense a", "specials": "all", "ids": [15154, 430, 319, 2782, 36414, 1193, 3952, 435, 13184, 1606, 10455, 27718, 1461, 11, 323, 430, 435, 13184, 2643, 319, 1225, 4461, 617, 4529, 54276, 422, 568, 1047, 1027, 264, 2697, 810, 1089, 307, 9373, 464, 47492, 279, 2489, 1752, 89955, 80645, 323, 279, 5885, 315, 18083, 13, 71865, 323, 319, 59961, 617, 27528, 11, 358, 4510, 11, 264, 24779, 4717, 369, 433, 1462, 47329, 264]}
+{"text": "already alluded to, and it makes a detailed dwelling on their beauties\r\ndifficult in any space, and impossible in this. Mrs. Bennet we have\r\nglanced at, and it is not easy to say whether she is more exquisitely\r\namusing ", "specials": "all", "ids": [46584, 682, 38477, 311, 11, 323, 433, 3727, 264, 11944, 51688, 389, 872, 5017, 552, 319, 13798, 3951, 304, 904, 3634, 11, 323, 12266, 304, 420, 13, 18083, 13, 30880, 295, 584, 617, 319, 6200, 4979, 520, 11, 323, 433, 374, 539, 4228, 311, 2019, 3508, 1364, 374, 810, 506, 9383, 275, 989, 319, 309, 985, 220]}
+{"text": "dmiration to love, from love\r\nto matrimony, in a moment. I knew you would be wishing me joy.”\r\n\r\n“Nay, if you are so serious about it, I shall consider the matter as\r\nabsolutely settled. You will have a charming mother-in-law, indeed, and\r\nof course she will b", "specials": "all", "ids": [14170, 20202, 311, 3021, 11, 505, 3021, 319, 998, 5634, 6417, 3633, 11, 304, 264, 4545, 13, 358, 7020, 499, 1053, 387, 46227, 757, 16267, 2029, 881, 2118, 45, 352, 11, 422, 499, 527, 779, 6129, 922, 433, 11, 358, 4985, 2980, 279, 5030, 439, 319, 3518, 9887, 23183, 13, 1472, 690, 617, 264, 35509, 6691, 3502, 31412, 11, 13118, 11, 323, 319, 1073, 3388, 1364, 690, 293]}
+{"text": "been so unlucky as to lose your friendship,” replied Elizabeth,\r\nwith emphasis, “and in a manner which he is likely to suffer from all\r\nhis life.”\r\n\r\nDarcy made no answer, and seemed desirous of changing the subject. At\r\nthat moment Sir Wil", "specials": "all", "ids": [82850, 779, 89544, 439, 311, 9229, 701, 27607, 2476, 20592, 21393, 1909, 4291, 25679, 11, 1054, 438, 304, 264, 11827, 902, 568, 374, 4461, 311, 7831, 505, 682, 319, 26301, 2324, 2029, 881, 35, 97479, 1903, 912, 4320, 11, 323, 9508, 951, 404, 788, 315, 10223, 279, 3917, 13, 2468, 319, 9210, 4545, 17177, 10785]}
+{"text": " another day, and\r\nwarn me off his grounds.”\r\n\r\nElizabeth felt that they had entirely mistaken his character, but said\r\nnothing.\r\n\r\n“From what we have seen of him,” continued Mrs. Gardiner, “I really\r\nshould not have thought that he could have behaved in so cruel a way by\r\nanybody as he has done by ", "specials": "all", "ids": [2500, 1938, 11, 323, 319, 34581, 757, 1022, 813, 21319, 2029, 881, 76637, 6612, 430, 814, 1047, 11622, 37104, 813, 3752, 11, 719, 1071, 319, 42312, 18304, 2118, 3915, 1148, 584, 617, 3970, 315, 1461, 2476, 8738, 18083, 13, 23251, 10670, 11, 1054, 40, 2216, 319, 5562, 539, 617, 3463, 430, 568, 1436, 617, 89831, 304, 779, 28128, 264, 1648, 555, 319, 3852, 2664, 439, 568, 706, 2884, 555, 220]}
+{"text": "im of their having seen his aunt, of which her daughter sat in\r\nmomentary dread, Bingley, who wanted to be alone with Jane, proposed\r\ntheir all walking out. It was agreed to. Mrs. Bennet was not in th", "specials": "all", "ids": [318, 315, 872, 3515, 3970, 813, 51166, 11, 315, 902, 1077, 10003, 7731, 304, 319, 29699, 661, 36075, 11, 426, 2222, 88, 11, 889, 4934, 311, 387, 7636, 449, 22195, 11, 11223, 319, 50828, 682, 11689, 704, 13, 1102, 574, 7378, 311, 13, 18083, 13, 30880, 295, 574, 539, 304, 270]}

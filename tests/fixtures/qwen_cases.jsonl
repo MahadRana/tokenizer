@@ -1,0 +1,314 @@
+{"text": "", "ids": []}
+{"text": "The capital of France is", "ids": [785, 6722, 315, 9625, 374]}
+{"text": "hello", "ids": [14990]}
+{"text": "Hello", "ids": [9707]}
+{"text": " world", "ids": [1879]}
+{"text": "hello world", "ids": [14990, 1879]}
+{"text": "Hello, world!", "ids": [9707, 11, 1879, 0]}
+{"text": "tokenization", "ids": [5839, 2022]}
+{"text": "a", "ids": [64]}
+{"text": "ab", "ids": [370]}
+{"text": " ", "ids": [220]}
+{"text": "  ", "ids": [256]}
+{"text": "   ", "ids": [262]}
+{"text": "\n", "ids": [198]}
+{"text": "\n\n", "ids": [271]}
+{"text": "\t", "ids": [197]}
+{"text": "\t\t", "ids": [298]}
+{"text": "\r\n", "ids": [319]}
+{"text": "\r\n\r\n", "ids": [871]}
+{"text": " \n ", "ids": [715, 220]}
+{"text": "end ", "ids": [408, 220]}
+{"text": "  hello", "ids": [220, 23811]}
+{"text": "'s", "ids": [594]}
+{"text": "'t", "ids": [944]}
+{"text": "'re", "ids": [2299]}
+{"text": "'ve", "ids": [3003]}
+{"text": "'m", "ids": [2776]}
+{"text": "'ll", "ids": [3278]}
+{"text": "'d", "ids": [4172]}
+{"text": "'S", "ids": [13272]}
+{"text": "'LL", "ids": [6, 4086]}
+{"text": "it's", "ids": [275, 594]}
+{"text": "don't", "ids": [15007, 944]}
+{"text": "they're", "ids": [20069, 2299]}
+{"text": "I've", "ids": [40, 3003]}
+{"text": "I'm", "ids": [40, 2776]}
+{"text": "we'll", "ids": [896, 3278]}
+{"text": "he'd", "ids": [383, 4172]}
+{"text": "0", "ids": [15]}
+{"text": "123", "ids": [16, 17, 18]}
+{"text": "12345", "ids": [16, 17, 18, 19, 20]}
+{"text": "999999", "ids": [24, 24, 24, 24, 24, 24]}
+{"text": "3.14", "ids": [18, 13, 16, 19]}
+{"text": "1,000", "ids": [16, 11, 15, 15, 15]}
+{"text": "café", "ids": [924, 58858]}
+{"text": "é", "ids": [963]}
+{"text": "café déjà", "ids": [924, 58858, 45839]}
+{"text": "naïve", "ids": [3376, 37572, 586]}
+{"text": "ä", "ids": [2305]}
+{"text": "ñ", "ids": [5653]}
+{"text": "é", "ids": [963]}
+{"text": "🙂", "ids": [145080]}
+{"text": "🦀", "ids": [147579]}
+{"text": "👨‍👩‍👧‍👦", "ids": [145367, 378, 235, 145233, 378, 235, 145665, 378, 235, 145988]}
+{"text": "日本語", "ids": [101059, 102819]}
+{"text": "你好", "ids": [108386]}
+{"text": "Привет", "ids": [53645, 26991, 8178]}
+{"text": "...", "ids": [1112]}
+{"text": "aaaaaaaa", "ids": [69440]}
+{"text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ids": [69440, 69440, 69440, 69440, 69440]}
+{"text": "The quick brown fox jumps over the lazy dog.", "ids": [785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13]}
+{"text": "line1\nline2\nline3", "ids": [1056, 16, 198, 1056, 17, 198, 1056, 18]}
+{"text": "tabs\tand\tspaces ", "ids": [30993, 52477, 1903, 27338, 220]}
+{"text": "quote: 'hello'", "ids": [2949, 25, 364, 14990, 6]}
+{"text": "quote: \"hello\"", "ids": [2949, 25, 330, 14990, 1]}
+{"text": "price is $5", "ids": [6555, 374, 400, 20]}
+{"text": "C++", "ids": [34, 1027]}
+{"text": "100%", "ids": [16, 15, 15, 4]}
+{"text": "a—b", "ids": [64, 2293, 65]}
+{"text": "foo bar", "ids": [7975, 4102, 2257]}
+{"text": "mixed 123 café\n\t🙂", "ids": [56685, 220, 16, 17, 18, 51950, 198, 197, 145080]}
+{"text": "<|endoftext|>", "ids": [151643]}
+{"text": "hello <|endoftext|> world", "ids": [14990, 220, 151643, 1879]}
+{"text": "<|endoftext|><|endoftext|>", "ids": [151643, 151643]}
+{"text": "<|im_start|>", "ids": [151644]}
+{"text": "hello <|im_start|> world", "ids": [14990, 220, 151644, 1879]}
+{"text": "<|im_start|><|im_start|>", "ids": [151644, 151644]}
+{"text": "<|im_end|>", "ids": [151645]}
+{"text": "hello <|im_end|> world", "ids": [14990, 220, 151645, 1879]}
+{"text": "<|im_end|><|im_end|>", "ids": [151645, 151645]}
+{"text": "<|object_ref_start|>", "ids": [151646]}
+{"text": "hello <|object_ref_start|> world", "ids": [14990, 220, 151646, 1879]}
+{"text": "<|object_ref_start|><|object_ref_start|>", "ids": [151646, 151646]}
+{"text": "<|object_ref_end|>", "ids": [151647]}
+{"text": "hello <|object_ref_end|> world", "ids": [14990, 220, 151647, 1879]}
+{"text": "<|object_ref_end|><|object_ref_end|>", "ids": [151647, 151647]}
+{"text": "<|box_start|>", "ids": [151648]}
+{"text": "hello <|box_start|> world", "ids": [14990, 220, 151648, 1879]}
+{"text": "<|box_start|><|box_start|>", "ids": [151648, 151648]}
+{"text": "<|box_end|>", "ids": [151649]}
+{"text": "hello <|box_end|> world", "ids": [14990, 220, 151649, 1879]}
+{"text": "<|box_end|><|box_end|>", "ids": [151649, 151649]}
+{"text": "<|quad_start|>", "ids": [151650]}
+{"text": "hello <|quad_start|> world", "ids": [14990, 220, 151650, 1879]}
+{"text": "<|quad_start|><|quad_start|>", "ids": [151650, 151650]}
+{"text": "<|quad_end|>", "ids": [151651]}
+{"text": "hello <|quad_end|> world", "ids": [14990, 220, 151651, 1879]}
+{"text": "<|quad_end|><|quad_end|>", "ids": [151651, 151651]}
+{"text": "<|vision_start|>", "ids": [151652]}
+{"text": "hello <|vision_start|> world", "ids": [14990, 220, 151652, 1879]}
+{"text": "<|vision_start|><|vision_start|>", "ids": [151652, 151652]}
+{"text": "<|vision_end|>", "ids": [151653]}
+{"text": "hello <|vision_end|> world", "ids": [14990, 220, 151653, 1879]}
+{"text": "<|vision_end|><|vision_end|>", "ids": [151653, 151653]}
+{"text": "<|vision_pad|>", "ids": [151654]}
+{"text": "hello <|vision_pad|> world", "ids": [14990, 220, 151654, 1879]}
+{"text": "<|vision_pad|><|vision_pad|>", "ids": [151654, 151654]}
+{"text": "<|image_pad|>", "ids": [151655]}
+{"text": "hello <|image_pad|> world", "ids": [14990, 220, 151655, 1879]}
+{"text": "<|image_pad|><|image_pad|>", "ids": [151655, 151655]}
+{"text": "<|video_pad|>", "ids": [151656]}
+{"text": "hello <|video_pad|> world", "ids": [14990, 220, 151656, 1879]}
+{"text": "<|video_pad|><|video_pad|>", "ids": [151656, 151656]}
+{"text": "<tool_call>", "ids": [151657]}
+{"text": "hello <tool_call> world", "ids": [14990, 220, 151657, 1879]}
+{"text": "<tool_call><tool_call>", "ids": [151657, 151657]}
+{"text": "</tool_call>", "ids": [151658]}
+{"text": "hello </tool_call> world", "ids": [14990, 220, 151658, 1879]}
+{"text": "</tool_call></tool_call>", "ids": [151658, 151658]}
+{"text": "<|fim_prefix|>", "ids": [151659]}
+{"text": "hello <|fim_prefix|> world", "ids": [14990, 220, 151659, 1879]}
+{"text": "<|fim_prefix|><|fim_prefix|>", "ids": [151659, 151659]}
+{"text": "<|fim_middle|>", "ids": [151660]}
+{"text": "hello <|fim_middle|> world", "ids": [14990, 220, 151660, 1879]}
+{"text": "<|fim_middle|><|fim_middle|>", "ids": [151660, 151660]}
+{"text": "<|fim_suffix|>", "ids": [151661]}
+{"text": "hello <|fim_suffix|> world", "ids": [14990, 220, 151661, 1879]}
+{"text": "<|fim_suffix|><|fim_suffix|>", "ids": [151661, 151661]}
+{"text": "<|fim_pad|>", "ids": [151662]}
+{"text": "hello <|fim_pad|> world", "ids": [14990, 220, 151662, 1879]}
+{"text": "<|fim_pad|><|fim_pad|>", "ids": [151662, 151662]}
+{"text": "<|repo_name|>", "ids": [151663]}
+{"text": "hello <|repo_name|> world", "ids": [14990, 220, 151663, 1879]}
+{"text": "<|repo_name|><|repo_name|>", "ids": [151663, 151663]}
+{"text": "<|file_sep|>", "ids": [151664]}
+{"text": "hello <|file_sep|> world", "ids": [14990, 220, 151664, 1879]}
+{"text": "<|file_sep|><|file_sep|>", "ids": [151664, 151664]}
+{"text": "hello <|endoftext|>", "ids": [14990, 220, 151643]}
+{"text": "<|im_start|>user\nHello<|im_end|>\n", "ids": [151644, 872, 198, 9707, 151645, 198]}
+{"text": "a<|fim_prefix|>b<|fim_suffix|>", "ids": [64, 151659, 65, 151661]}
+{"text": "n=0", "ids": [77, 28, 15]}
+{"text": "1", "ids": [16]}
+{"text": "n=1", "ids": [77, 28, 16]}
+{"text": "2", "ids": [17]}
+{"text": "n=2", "ids": [77, 28, 17]}
+{"text": "3", "ids": [18]}
+{"text": "n=3", "ids": [77, 28, 18]}
+{"text": "4", "ids": [19]}
+{"text": "n=4", "ids": [77, 28, 19]}
+{"text": "5", "ids": [20]}
+{"text": "n=5", "ids": [77, 28, 20]}
+{"text": "6", "ids": [21]}
+{"text": "n=6", "ids": [77, 28, 21]}
+{"text": "7", "ids": [22]}
+{"text": "n=7", "ids": [77, 28, 22]}
+{"text": "8", "ids": [23]}
+{"text": "n=8", "ids": [77, 28, 23]}
+{"text": "9", "ids": [24]}
+{"text": "n=9", "ids": [77, 28, 24]}
+{"text": "10", "ids": [16, 15]}
+{"text": "n=10", "ids": [77, 28, 16, 15]}
+{"text": "11", "ids": [16, 16]}
+{"text": "n=11", "ids": [77, 28, 16, 16]}
+{"text": "12", "ids": [16, 17]}
+{"text": "n=12", "ids": [77, 28, 16, 17]}
+{"text": "13", "ids": [16, 18]}
+{"text": "n=13", "ids": [77, 28, 16, 18]}
+{"text": "14", "ids": [16, 19]}
+{"text": "n=14", "ids": [77, 28, 16, 19]}
+{"text": "15", "ids": [16, 20]}
+{"text": "n=15", "ids": [77, 28, 16, 20]}
+{"text": "16", "ids": [16, 21]}
+{"text": "n=16", "ids": [77, 28, 16, 21]}
+{"text": "17", "ids": [16, 22]}
+{"text": "n=17", "ids": [77, 28, 16, 22]}
+{"text": "18", "ids": [16, 23]}
+{"text": "n=18", "ids": [77, 28, 16, 23]}
+{"text": "19", "ids": [16, 24]}
+{"text": "n=19", "ids": [77, 28, 16, 24]}
+{"text": "20", "ids": [17, 15]}
+{"text": "n=20", "ids": [77, 28, 17, 15]}
+{"text": "21", "ids": [17, 16]}
+{"text": "n=21", "ids": [77, 28, 17, 16]}
+{"text": "22", "ids": [17, 17]}
+{"text": "n=22", "ids": [77, 28, 17, 17]}
+{"text": "23", "ids": [17, 18]}
+{"text": "n=23", "ids": [77, 28, 17, 18]}
+{"text": "24", "ids": [17, 19]}
+{"text": "n=24", "ids": [77, 28, 17, 19]}
+{"text": "25", "ids": [17, 20]}
+{"text": "n=25", "ids": [77, 28, 17, 20]}
+{"text": "26", "ids": [17, 21]}
+{"text": "n=26", "ids": [77, 28, 17, 21]}
+{"text": "27", "ids": [17, 22]}
+{"text": "n=27", "ids": [77, 28, 17, 22]}
+{"text": "28", "ids": [17, 23]}
+{"text": "n=28", "ids": [77, 28, 17, 23]}
+{"text": "29", "ids": [17, 24]}
+{"text": "n=29", "ids": [77, 28, 17, 24]}
+{"text": "The capital of France is Paris, and the river is the Seine. Don't stop at 12345. We'll see café at 6.\n", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 14796, 374, 279, 1345, 482, 13, 4320, 944, 2936, 518, 220, 16, 17, 18, 19, 20, 13, 1205, 3278, 1490, 51950, 518, 220, 21, 624]}
+{"text": "T", "ids": [51]}
+{"text": "The capi", "ids": [785, 2062, 72]}
+{"text": "The capital of ", "ids": [785, 6722, 315, 220]}
+{"text": "The capital of France ", "ids": [785, 6722, 315, 9625, 220]}
+{"text": "The capital of France is Pari", "ids": [785, 6722, 315, 9625, 374, 393, 2780]}
+{"text": "The capital of France is Paris, and ", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 220]}
+{"text": "The capital of France is Paris, and the riv", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 43129]}
+{"text": "The capital of France is Paris, and the river is t", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 14796, 374, 259]}
+{"text": "The capital of France is Paris, and the river is the Sein", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 14796, 374, 279, 1345, 258]}
+{"text": "The capital of France is Paris, and the river is the Seine. Don'", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 14796, 374, 279, 1345, 482, 13, 4320, 6]}
+{"text": "The capital of France is Paris, and the river is the Seine. Don't stop ", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 14796, 374, 279, 1345, 482, 13, 4320, 944, 2936, 220]}
+{"text": "The capital of France is Paris, and the river is the Seine. Don't stop at 1234", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 14796, 374, 279, 1345, 482, 13, 4320, 944, 2936, 518, 220, 16, 17, 18, 19]}
+{"text": "The capital of France is Paris, and the river is the Seine. Don't stop at 12345. We'l", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 14796, 374, 279, 1345, 482, 13, 4320, 944, 2936, 518, 220, 16, 17, 18, 19, 20, 13, 1205, 63866]}
+{"text": "The capital of France is Paris, and the river is the Seine. Don't stop at 12345. We'll see c", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 14796, 374, 279, 1345, 482, 13, 4320, 944, 2936, 518, 220, 16, 17, 18, 19, 20, 13, 1205, 3278, 1490, 272]}
+{"text": "The capital of France is Paris, and the river is the Seine. Don't stop at 12345. We'll see café at ", "ids": [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 14796, 374, 279, 1345, 482, 13, 4320, 944, 2936, 518, 220, 16, 17, 18, 19, 20, 13, 1205, 3278, 1490, 51950, 518, 220]}
+{"text": "a b", "ids": [64, 293]}
+{"text": "a  b", "ids": [64, 220, 293]}
+{"text": "\n\n\n", "ids": [1406]}
+{"text": "a   b", "ids": [64, 256, 293]}
+{"text": "    ", "ids": [257]}
+{"text": "\n\n\n\n", "ids": [1022]}
+{"text": "a    b", "ids": [64, 262, 293]}
+{"text": "     ", "ids": [414]}
+{"text": "\n\n\n\n\n", "ids": [14621]}
+{"text": "a     b", "ids": [64, 257, 293]}
+{"text": "      ", "ids": [981]}
+{"text": "\n\n\n\n\n\n", "ids": [5134]}
+{"text": "a      b", "ids": [64, 414, 293]}
+{"text": "       ", "ids": [286]}
+{"text": "\n\n\n\n\n\n\n", "ids": [34583]}
+{"text": "a       b", "ids": [64, 981, 293]}
+{"text": "        ", "ids": [260]}
+{"text": "\n\n\n\n\n\n\n\n", "ids": [5959]}
+{"text": "a        b", "ids": [64, 286, 293]}
+{"text": ".", "ids": [13]}
+{"text": "a.b", "ids": [64, 948]}
+{"text": ",", "ids": [11]}
+{"text": "a,b", "ids": [64, 8402]}
+{"text": ";", "ids": [26]}
+{"text": "a;b", "ids": [64, 54933]}
+{"text": ":", "ids": [25]}
+{"text": "a:b", "ids": [64, 43973]}
+{"text": "!", "ids": [0]}
+{"text": "a!b", "ids": [64, 0, 65]}
+{"text": "?", "ids": [30]}
+{"text": "a?b", "ids": [64, 30, 65]}
+{"text": "(", "ids": [7]}
+{"text": "a(b", "ids": [64, 1883]}
+{"text": ")", "ids": [8]}
+{"text": "a)b", "ids": [64, 78878]}
+{"text": "[", "ids": [58]}
+{"text": "a[b", "ids": [64, 18483]}
+{"text": "]", "ids": [60]}
+{"text": "a]b", "ids": [64, 60, 65]}
+{"text": "{", "ids": [90]}
+{"text": "a{b", "ids": [64, 90, 65]}
+{"text": "}", "ids": [92]}
+{"text": "a}b", "ids": [64, 92, 65]}
+{"text": "<", "ids": [27]}
+{"text": "a<b", "ids": [64, 33177]}
+{"text": ">", "ids": [29]}
+{"text": "a>b", "ids": [64, 51407]}
+{"text": "@", "ids": [31]}
+{"text": "a@b", "ids": [64, 31, 65]}
+{"text": "#", "ids": [2]}
+{"text": "a#b", "ids": [64, 2, 65]}
+{"text": "%", "ids": [4]}
+{"text": "a%b", "ids": [64, 4, 65]}
+{"text": "^", "ids": [61]}
+{"text": "a^b", "ids": [64, 61, 65]}
+{"text": "&", "ids": [5]}
+{"text": "a&b", "ids": [64, 5, 65]}
+{"text": "*", "ids": [9]}
+{"text": "a*b", "ids": [64, 33279]}
+{"text": "-", "ids": [12]}
+{"text": "a-b", "ids": [64, 1455]}
+{"text": "+", "ids": [10]}
+{"text": "a+b", "ids": [64, 35093]}
+{"text": "=", "ids": [28]}
+{"text": "a=b", "ids": [64, 22086]}
+{"text": "/", "ids": [14]}
+{"text": "a/b", "ids": [64, 3470]}
+{"text": "\\", "ids": [59]}
+{"text": "a\\b", "ids": [64, 43456]}
+{"text": "|", "ids": [91]}
+{"text": "a|b", "ids": [64, 91, 65]}
+{"text": "\"", "ids": [1]}
+{"text": "a\"b", "ids": [64, 1, 65]}
+{"text": "'", "ids": [6]}
+{"text": "a'b", "ids": [64, 90853]}
+{"text": "`", "ids": [63]}
+{"text": "a`b", "ids": [64, 63, 65]}
+{"text": "~", "ids": [93]}
+{"text": "a~b", "ids": [64, 93, 65]}
+{"text": "Paris", "ids": [59604]}
+{"text": "paris", "ids": [1732, 285]}
+{"text": " Paris", "ids": [12095]}
+{"text": "France", "ids": [49000]}
+{"text": "france", "ids": [1626, 681]}
+{"text": " France", "ids": [9625]}
+{"text": "Seine", "ids": [1514, 482]}
+{"text": "seine", "ids": [325, 482]}
+{"text": " Seine", "ids": [1345, 482]}
+{"text": "Qwen", "ids": [48, 16948]}
+{"text": "qwen", "ids": [80, 16948]}
+{"text": " Qwen", "ids": [1207, 16948]}
+{"text": "tokenizer", "ids": [85593]}
+{"text": " tokenizer", "ids": [45958]}
+{"text": "Rust", "ids": [49, 590]}
+{"text": "rust", "ids": [35788]}
+{"text": " Rust", "ids": [33789]}
+{"text": "BPE", "ids": [33, 1740]}
+{"text": "bpe", "ids": [65, 375]}
+{"text": " BPE", "ids": [425, 1740]}
