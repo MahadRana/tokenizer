@@ -1,0 +1,27 @@
+[package]
+name = "tokenizer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tiktoken-rs = "0.12.1"
+
+[dependencies.tokenizer]
+path = ".."
+
+# This package is its own workspace so `cargo test` in the library does not
+# build the fuzz target (that build needs nightly and a sanitizer).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_encode"
+path = "fuzz_targets/fuzz_encode.rs"
+test = false
+doc = false
+bench = false

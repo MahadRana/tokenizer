@@ -9,8 +9,15 @@ fancy-regex = "0.20"
 
 [dev-dependencies]
 criterion = "0.8.2"
+# proptest 1.12.0 (docs.rs). `prop_oneof!` boxes each arm, `str` is a regex
+# strategy, and `Config::default` reads `PROPTEST_CASES` (default 256).
+proptest = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# tiktoken-rs 0.12.1 (docs.rs). Test oracle only. `cl100k_base()` returns
+# `CoreBPE`; `encode_with_special_tokens(&str) -> Vec<Rank>` with `Rank = u32`.
+# Its cl100k pattern string matches `CL100K_PAT`.
+tiktoken-rs = "0.12.1"
 
 [[bench]]
 name = "cl100k_encode"

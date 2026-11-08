@@ -50,3 +50,16 @@ Measured 2026-11-02, rustc 1.99.1 (58cf8f9c3 2026-10-13), same machine as the ro
 | `cl100k_encode/book` | **73.636 ms** (72.820–74.501 ms) | **10.003 MiB/s** (9.8872–10.115 MiB/s) |
 
 772,386 bytes / 0.073636 s = **10.49 MB/s** using 10^6 bytes per MB. Criterion's MiB is 2^20. The file encodes to 177,179 tokens (`encode_matches_tiktoken_on_book`, release), 4.36 bytes/token. Gnuplot was not installed; criterion used the plotters backend. The number is one criterion estimate, not a hyperfine mean of the training binary.
+
+## A5: property tests, fuzz, and the Python cross-check
+
+Not the training command. Same machine as the rows above (Linux 6.12.94+ x86_64, 4 vCPUs, Intel Xeon family 6 model 207, MemTotal 16,387,280 kB). Debug tests used rustc 1.99.1 (58cf8f9c3 2026-10-13). The fuzzer used rustc 1.101.0-nightly (1c3a65069 2026-11-02).
+
+| | measured |
+|---|---|
+| `prop_round_trip_bytes`, 10,000 cases | **1.72 s** (harness; includes the cl100k load) |
+| `prop_matches_tiktoken_rs`, 10,000 cases | **2.24 s** (harness; includes the cl100k load and tiktoken-rs init) |
+| `fuzz_encode`, libFuzzer `-max_total_time=1800` | **1,801 s**, **1,257,627** executions, 698 exec/s average, no mismatch |
+| Python tiktoken 0.14.0 on 10 Gutenberg files | **10,610,901** bytes, **0** diffs |
+
+`PROPTEST_CASES=20` on the round-trip property finished in 0.19 s, and `PROPTEST_CASES=10000` finished in 1.71 s, which is the unset default. CI runs the 10,000-case default. These are single harness readings, not hyperfine means.
