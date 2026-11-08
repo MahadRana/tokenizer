@@ -21,7 +21,28 @@ use tokio::task::JoinHandle as TaskHandle;
 pub use chat::{ChatTurn, TemplateError, apply_qwen_chat_template};
 pub use engine::EngineStats;
 
-use engine::engine_thread;
+use engine::{Ingress, engine_thread};
+
+/// Admission limits for the iteration scheduler.
+///
+/// `max_batch_size` is how many sequences run a forward together.
+/// `max_waiting` is how many more may sit in the FIFO. A request past both
+/// is HTTP 429. The defaults match the old queue depth (32 waiting) and a
+/// batch of 8, which is the size the throughput check uses.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub max_batch_size: usize,
+    pub max_waiting: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 8,
+            max_waiting: 32,
+        }
+    }
+}
 use tokenizer::TokenizerError;
 
 /// Id returned by `GET /v1/models` and required on `model`.
@@ -48,7 +69,7 @@ impl TokenCodec for tokenizer::RankTokenizer {
 }
 
 pub struct AppState {
-    pub(crate) requests: std::sync::mpsc::SyncSender<engine::GenRequest>,
+    pub(crate) requests: Ingress,
     pub(crate) codec: Arc<dyn TokenCodec>,
     pub(crate) eos: Vec<u32>,
     pub(crate) max_position: usize,
@@ -124,29 +145,61 @@ impl Drop for Server {
 /// Bind `bind` and spawn the engine thread. `model` moves to that thread.
 ///
 /// `eos` is copied onto every request. Qwen2.5-0.5B-Instruct uses the ids
-/// from `generation_config.json`.
+/// from `generation_config.json`. Admission uses [`ServerConfig::default`].
 pub async fn serve(
     model: qwen_infer::QwenModel,
     codec: Arc<dyn TokenCodec>,
     eos: Vec<u32>,
     bind: SocketAddr,
 ) -> anyhow::Result<Server> {
+    serve_with(model, codec, eos, bind, ServerConfig::default()).await
+}
+
+/// [`serve`] with an explicit batch and waiting-queue limit.
+pub async fn serve_with(
+    model: qwen_infer::QwenModel,
+    codec: Arc<dyn TokenCodec>,
+    eos: Vec<u32>,
+    bind: SocketAddr,
+    config: ServerConfig,
+) -> anyhow::Result<Server> {
+    if config.max_batch_size == 0 {
+        anyhow::bail!("max_batch_size must be at least 1");
+    }
     let max_position = model.max_position_embeddings();
-    let (req_tx, req_rx) = std::sync::mpsc::sync_channel(32);
+    let max_inflight = config.max_batch_size.saturating_add(config.max_waiting);
+    // The channel is at least as deep as the admission cap, so a reserved
+    // slot can always be queued. `TrySendError::Full` is then the defensive
+    // path (the counter and the channel disagree), not the 429 path.
+    let (req_tx, req_rx) = std::sync::mpsc::sync_channel(max_inflight.max(1));
     let shutdown = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(EngineStats::default()));
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let engine = std::thread::Builder::new()
         .name("qwen-engine".into())
         .spawn({
             let shutdown = Arc::clone(&shutdown);
             let stats = Arc::clone(&stats);
             let codec = Arc::clone(&codec);
-            move || engine_thread(req_rx, model, codec, shutdown, stats)
+            let inflight = Arc::clone(&inflight);
+            let max_batch_size = config.max_batch_size;
+            move || {
+                engine_thread(
+                    req_rx,
+                    model,
+                    codec,
+                    shutdown,
+                    stats,
+                    inflight,
+                    max_batch_size,
+                )
+            }
         })
         .map_err(|err| anyhow::anyhow!("spawn engine thread: {err}"))?;
+    let requests = Ingress::new(req_tx, inflight, config.max_batch_size, config.max_waiting);
 
     let state = Arc::new(AppState {
-        requests: req_tx,
+        requests,
         codec,
         eos,
         max_position,

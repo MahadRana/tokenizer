@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use qwen_server::{ChatTurn, Server, TokenCodec, apply_qwen_chat_template};
+use qwen_server::{ChatTurn, Server, ServerConfig, TokenCodec, apply_qwen_chat_template};
 use serde_json::{Value, json};
 use tokenizer::TokenizerError;
 
@@ -27,6 +27,22 @@ fn c_as_u32(ch: char) -> u32 {
     u32::from(ch)
 }
 
+/// Same ids as [`CharCodec`]. Each token is many kilobytes, so one unread
+/// SSE event fills the socket window and the engine's token channel returns
+/// [`tokio::sync::mpsc::error::TrySendError::Full`].
+struct FatCodec;
+
+impl TokenCodec for FatCodec {
+    fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
+        TokenCodec::encode(&CharCodec, text)
+    }
+
+    fn decode_token(&self, id: u32) -> Result<Vec<u8>, TokenizerError> {
+        let _ = id;
+        Ok(vec![b'x'; 8192])
+    }
+}
+
 /// Same ids as [`CharCodec`], but each decode sleeps so a client can drop
 /// the socket before a 200-token run fits in the kernel buffer.
 struct SlowCodec;
@@ -43,8 +59,12 @@ impl TokenCodec for SlowCodec {
 }
 
 async fn spawn(codec: Arc<dyn TokenCodec>, eos: Vec<u32>) -> Server {
+    spawn_with(codec, eos, ServerConfig::default()).await
+}
+
+async fn spawn_with(codec: Arc<dyn TokenCodec>, eos: Vec<u32>, config: ServerConfig) -> Server {
     let model = qwen_infer::tiny_model(false);
-    qwen_server::serve(model, codec, eos, "127.0.0.1:0".parse().unwrap())
+    qwen_server::serve_with(model, codec, eos, "127.0.0.1:0".parse().unwrap(), config)
         .await
         .expect("serve")
 }
@@ -258,7 +278,7 @@ async fn sse_values(client: &reqwest::Client, server: &Server, body: &Value) -> 
 
 #[tokio::test]
 async fn shutdown_cancels_a_stream_the_client_never_reads() {
-    let server = spawn(Arc::new(CharCodec), Vec::new()).await;
+    let server = spawn(Arc::new(FatCodec), Vec::new()).await;
     let addr = server.addr();
     let body = chat_body(json!({"stream": true, "max_tokens": 1500})).to_string();
     let request = format!(
@@ -276,9 +296,20 @@ async fn shutdown_cancels_a_stream_the_client_never_reads() {
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut buf = [0u8; 256];
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
-    // Stop reading. The engine fills the token channel and would block forever
-    // on `blocking_send`. Shutdown has to notice the flag and return.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Stop reading. The SSE task blocks once the socket window fills, the
+    // token channel (capacity 1) returns `TrySendError::Full`, and the engine
+    // sleeps instead of `blocking_send`. Wait until that Full is observed,
+    // then shut down. Shutdown has to notice the flag between those retries.
+    let mut stats = server.stats();
+    let fill_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while stats.token_channel_full == 0 && std::time::Instant::now() < fill_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stats = server.stats();
+    }
+    assert!(
+        stats.token_channel_full > 0,
+        "token channel never returned Full before shutdown: {stats:?}"
+    );
     let started = std::time::Instant::now();
     let stats = tokio::time::timeout(Duration::from_secs(2), server.shutdown())
         .await
@@ -293,9 +324,13 @@ async fn shutdown_cancels_a_stream_the_client_never_reads() {
         stats.last_completion_tokens < 1500,
         "generation ran to max_tokens instead of stopping: {stats:?}"
     );
+    assert!(
+        stats.token_channel_full > 0,
+        "shutdown returned without observing TrySendError::Full on the token channel: {stats:?}"
+    );
     eprintln!(
-        "shutdown of an unread stream took {elapsed:?} after {} completion tokens (max 1500, cancelled {})",
-        stats.last_completion_tokens, stats.last_cancelled
+        "shutdown of an unread stream took {elapsed:?} after {} completion tokens (max 1500, cancelled {}, token channel Full {})",
+        stats.last_completion_tokens, stats.last_cancelled, stats.token_channel_full
     );
     drop(stream);
 }
@@ -391,6 +426,165 @@ async fn disconnect_cancels_generation() {
         stats.last_completion_tokens, stats.last_max_tokens
     );
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn short_request_joins_a_running_batch() {
+    let server = spawn_with(
+        Arc::new(SlowCodec),
+        Vec::new(),
+        ServerConfig {
+            max_batch_size: 4,
+            max_waiting: 4,
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let mut long = client
+        .post(url(&server, "/v1/chat/completions"))
+        .json(&chat_body(json!({
+            "stream": true,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "Please write a longer note"}]
+        })))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(long.status(), 200);
+    let mut buf = Vec::new();
+    loop {
+        let Some(chunk) = long.chunk().await.unwrap() else {
+            panic!("long request ended before a content token");
+        };
+        buf.extend_from_slice(&chunk);
+        if buf.windows(9).any(|window| window == b"\"content\"") {
+            break;
+        }
+    }
+    let started = std::time::Instant::now();
+    let short_url = url(&server, "/v1/chat/completions");
+    let short_client = client.clone();
+    let short = tokio::spawn(async move {
+        short_client
+            .post(short_url)
+            .json(&chat_body(json!({
+                "stream": false,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "Hi"}]
+            })))
+            .send()
+            .await
+            .unwrap()
+    });
+    let mut long_done = false;
+    tokio::pin!(short);
+    let short = loop {
+        tokio::select! {
+            chunk = long.chunk() => {
+                match chunk.unwrap() {
+                    Some(bytes) => {
+                        if bytes.windows(6).any(|window| window == b"[DONE]") {
+                            long_done = true;
+                        }
+                    }
+                    None => long_done = true,
+                }
+            }
+            result = &mut short => break result.unwrap(),
+        }
+    };
+    let elapsed = started.elapsed();
+    assert_eq!(short.status(), 200, "{short:?}");
+    assert!(
+        !long_done,
+        "short request waited until the long stream finished ({elapsed:?})"
+    );
+    assert!(
+        server.stats().max_running >= 2,
+        "short request never joined the running batch: {:?}",
+        server.stats()
+    );
+    eprintln!(
+        "short request joined a running batch in {elapsed:?}, max_running {}",
+        server.stats().max_running
+    );
+    drop(long);
+    drop(short);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn over_capacity_returns_429() {
+    // One running slot and no queue: the second reservation is 429.
+    // SlowCodec keeps the first request inside the engine so the slot is
+    // still held when the second request arrives.
+    let server = spawn_with(
+        Arc::new(SlowCodec),
+        Vec::new(),
+        ServerConfig {
+            max_batch_size: 1,
+            max_waiting: 0,
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let held = client
+        .post(url(&server, "/v1/chat/completions"))
+        .json(&chat_body(json!({"stream": true, "max_tokens": 40})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+    let rejected = client
+        .post(url(&server, "/v1/chat/completions"))
+        .json(&chat_body(json!({"stream": false, "max_tokens": 4})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 429);
+    assert_rate_limit(&rejected.json().await.unwrap());
+    drop(held);
+    server.shutdown().await;
+
+    // A full batch plus a full waiting FIFO. The next request is 429.
+    let server = spawn_with(
+        Arc::new(SlowCodec),
+        Vec::new(),
+        ServerConfig {
+            max_batch_size: 1,
+            max_waiting: 1,
+        },
+    )
+    .await;
+    let mut held = Vec::new();
+    for index in 0..2 {
+        let response = client
+            .post(url(&server, "/v1/chat/completions"))
+            .json(&chat_body(json!({"stream": true, "max_tokens": 40})))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "accepted request {index}");
+        held.push(response);
+    }
+    let rejected = client
+        .post(url(&server, "/v1/chat/completions"))
+        .json(&chat_body(json!({"stream": false, "max_tokens": 4})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 429);
+    assert_rate_limit(&rejected.json().await.unwrap());
+    drop(held);
+    server.shutdown().await;
+}
+
+fn assert_rate_limit(value: &Value) {
+    let error = &value["error"];
+    assert!(error["message"].is_string(), "{value}");
+    assert_eq!(error["type"], "rate_limit_error", "{value}");
+    assert!(error["param"].is_null(), "{value}");
+    assert_eq!(error["code"], "rate_limit_exceeded", "{value}");
 }
 
 #[tokio::test]
@@ -570,4 +764,175 @@ async fn openai_sdk_against_qwen_weights() {
     assert!(stdout.starts_with("OK "), "{stdout}");
     eprintln!("real-weight sdk: {stdout}");
     server.shutdown().await;
+}
+
+/// Eight identical greedy requests against the real weights. Total tokens per
+/// second of the concurrent run is compared to one request of the same shape.
+/// EOS is off so both sides run the full `max_tokens`.
+#[tokio::test]
+#[ignore = "downloads Qwen2.5-0.5B-Instruct and times 8 concurrent CPU generations"]
+async fn eight_concurrent_throughput_is_at_least_3x_one_request() {
+    let server = real_server(Vec::new()).await;
+    let client = reqwest::Client::new();
+    let body = chat_body(json!({"stream": false, "max_tokens": 16, "temperature": 0}));
+    // Fault the f32 weights in before either clock starts.
+    let _ = post_completion(&client, &server, &body).await;
+
+    let single_started = std::time::Instant::now();
+    let single = post_completion(&client, &server, &body).await;
+    let single_elapsed = single_started.elapsed();
+    let single_tokens = single["usage"]["completion_tokens"].as_u64().unwrap();
+    let single_text = single["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let batch_started = std::time::Instant::now();
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        let url = url(&server, "/v1/chat/completions");
+        let body = body.clone();
+        tasks.push(tokio::spawn(async move {
+            let response = client.post(url).json(&body).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            response.json::<Value>().await.unwrap()
+        }));
+    }
+    let mut batch_tokens = 0u64;
+    for task in tasks {
+        let body = task.await.unwrap();
+        let text = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(text, single_text, "batched greedy text diverged");
+        batch_tokens += body["usage"]["completion_tokens"].as_u64().unwrap();
+    }
+    let batch_elapsed = batch_started.elapsed();
+    let single_rate = single_tokens as f64 / single_elapsed.as_secs_f64();
+    let batch_rate = batch_tokens as f64 / batch_elapsed.as_secs_f64();
+    let ratio = batch_rate / single_rate;
+    eprintln!(
+        "single: {single_tokens} tokens in {:.4} s ({single_rate:.4} tok/s)",
+        single_elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "batch 8: {batch_tokens} tokens in {:.4} s ({batch_rate:.4} tok/s), {ratio:.2}x",
+        batch_elapsed.as_secs_f64()
+    );
+    assert!(
+        ratio >= 3.0,
+        "8-way total tok/s {batch_rate:.4} is {ratio:.2}x one request ({single_rate:.4}), wanted >= 3x"
+    );
+    server.shutdown().await;
+}
+
+/// One long generation is already running. A one-token request's time to
+/// first token stays well under the long request's remaining work.
+#[tokio::test]
+#[ignore = "downloads Qwen2.5-0.5B-Instruct and checks join-while-running TTFT"]
+async fn real_weight_short_request_joins_with_low_ttft() {
+    let server = real_server(Vec::new()).await;
+    let client = reqwest::Client::new();
+    let mut long = client
+        .post(url(&server, "/v1/chat/completions"))
+        .json(&chat_body(json!({
+            "stream": true,
+            "max_tokens": 12,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": "The capital of France is"}]
+        })))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(long.status(), 200);
+    let mut buf = Vec::new();
+    loop {
+        let Some(chunk) = long.chunk().await.unwrap() else {
+            panic!("long request ended before content");
+        };
+        buf.extend_from_slice(&chunk);
+        if buf.windows(9).any(|window| window == b"\"content\"") {
+            break;
+        }
+    }
+    let started = std::time::Instant::now();
+    let short_url = url(&server, "/v1/chat/completions");
+    let short_client = client.clone();
+    let short = tokio::spawn(async move {
+        let response = short_client
+            .post(short_url)
+            .json(&chat_body(json!({
+                "stream": false,
+                "max_tokens": 1,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": "Hi"}]
+            })))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        (status, body)
+    });
+    let mut long_done = false;
+    tokio::pin!(short);
+    let (status, body) = loop {
+        tokio::select! {
+            chunk = long.chunk() => {
+                match chunk.unwrap() {
+                    Some(bytes) => {
+                        if bytes.windows(6).any(|window| window == b"[DONE]") {
+                            long_done = true;
+                        }
+                    }
+                    None => long_done = true,
+                }
+            }
+            result = &mut short => break result.unwrap(),
+        }
+    };
+    let ttft = started.elapsed();
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !long_done,
+        "short request waited out the long one ({ttft:?})"
+    );
+    assert!(
+        server.stats().max_running >= 2,
+        "short request never joined: {:?}",
+        server.stats()
+    );
+    let text = body["choices"][0]["message"]["content"].as_str().unwrap();
+    eprintln!(
+        "real-weight short TTFT {:.4} s, text {text:?}, max_running {}, long still running",
+        ttft.as_secs_f64(),
+        server.stats().max_running
+    );
+    drop(long);
+    server.shutdown().await;
+}
+
+async fn real_server(eos: Vec<u32>) -> Server {
+    let files = qwen_infer::download_qwen().expect("hf-hub");
+    let tokenizer_path = files.tokenizer.to_str().expect("utf-8 path");
+    let tokenizer = tokenizer::RankTokenizer::load_qwen(tokenizer_path).expect("tokenizer");
+    let model = qwen_infer::load_model(&files.config, &files.weights).expect("weights");
+    qwen_server::serve(
+        model,
+        Arc::new(tokenizer),
+        eos,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn post_completion(client: &reqwest::Client, server: &Server, body: &Value) -> Value {
+    let response = client
+        .post(url(server, "/v1/chat/completions"))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.json().await.unwrap()
 }

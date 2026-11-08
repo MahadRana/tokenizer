@@ -8,7 +8,9 @@
 //!
 //! [`QwenModel`] does not own a cache. [`QwenModel::last_logits`] recomputes
 //! the whole sequence. [`QwenModel::forward`] takes a [`KvCache`] the caller
-//! mutates, which is what a later batch can share across sequences.
+//! mutates. [`QwenModel::forward_decode_batch`] runs the one-token decode of
+//! several of those caches in one matmul. Prefill stays on `forward`: prompts
+//! have different lengths, and packing them is a separate problem.
 
 use crate::sample::greedy_token;
 
@@ -167,6 +169,57 @@ impl RotaryEmbedding {
         // rope() rejects a non-contiguous head axis. transpose() leaves one.
         candle_nn::rotary_emb::rope(&xs.contiguous()?, &cos, &sin)
     }
+
+    /// RoPE for one new token per sequence, each at its own absolute position.
+    ///
+    /// `xs` is `(batch, heads, 1, head_dim)`. `positions[b]` is the absolute
+    /// position of that row. Equal positions take the same path as [`Self::apply`]
+    /// (one `(seq, freq)` table, shared across the batch). Different positions
+    /// build a `(batch, 1, freq)` table. `candle_nn::rotary_emb::rope` treats a
+    /// 3D cos/sin as per-batch: for one token the CPU kernel indexes
+    /// `i_d + batch_index * (head_dim / 2)`. That is the layout `cat` produces
+    /// here. Docs: <https://docs.rs/candle-nn/0.11.1/candle_nn/rotary_emb/fn.rope.html>
+    /// (`rope_check_cs` accepts `(t, d)` or `(b, t, d)`).
+    fn apply_positions(&self, xs: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        let (batch, _heads, seq, _dim) = xs.dims4()?;
+        if seq != 1 {
+            bail!("per-sequence RoPE is one token at a time, got seq {seq}");
+        }
+        if positions.len() != batch {
+            bail!(
+                "RoPE positions {} do not match batch {batch}",
+                positions.len()
+            );
+        }
+        if positions.is_empty() {
+            bail!("no RoPE positions");
+        }
+        let table = self.cos.dim(0)?;
+        for &pos in positions {
+            if pos >= table {
+                bail!("RoPE position {pos} is past the table ({table})");
+            }
+        }
+        if positions.iter().all(|pos| *pos == positions[0]) {
+            return self.apply(xs, positions[0]);
+        }
+        let freq = self.cos.dim(1)?;
+        let mut cos_rows = Vec::with_capacity(batch);
+        let mut sin_rows = Vec::with_capacity(batch);
+        for &pos in positions {
+            cos_rows.push(self.cos.narrow(0, pos, 1)?.contiguous()?);
+            sin_rows.push(self.sin.narrow(0, pos, 1)?.contiguous()?);
+        }
+        let cos_refs: Vec<&Tensor> = cos_rows.iter().collect();
+        let sin_refs: Vec<&Tensor> = sin_rows.iter().collect();
+        let cos = Tensor::cat(&cos_refs, 0)?
+            .reshape((batch, seq, freq))?
+            .contiguous()?;
+        let sin = Tensor::cat(&sin_refs, 0)?
+            .reshape((batch, seq, freq))?
+            .contiguous()?;
+        candle_nn::rotary_emb::rope(&xs.contiguous()?, &cos, &sin)
+    }
 }
 
 struct Mlp {
@@ -272,6 +325,115 @@ impl Attention {
             .reshape((batch, seq, self.num_heads * self.head_dim))?
             .apply(&self.o_proj)
     }
+
+    /// One new token for every sequence in `caches`.
+    ///
+    /// `xs` is `(batch, 1, hidden)`. `positions[i]` is the absolute position
+    /// of that token and the current [`KvCache::seq_len`] of `caches[i]`.
+    /// K and V are rotated, appended to that sequence's own cache, then padded
+    /// out to the longest cache in the batch so the attention matmul is one
+    /// tensor. Padding keys are masked; they are not part of the softmax.
+    fn forward_decode(
+        &self,
+        xs: &Tensor,
+        mask: &Tensor,
+        rope: &RotaryEmbedding,
+        positions: &[usize],
+        caches: &mut [&mut KvCache],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (batch, seq, _) = xs.dims3()?;
+        if seq != 1 || batch != caches.len() || positions.len() != batch {
+            bail!(
+                "decode batch is (batch, 1) with one cache and one position each, got xs {:?}, {} caches, {} positions",
+                xs.shape(),
+                caches.len(),
+                positions.len()
+            );
+        }
+        let q = self.q_proj.forward(xs)?;
+        let k = self.k_proj.forward(xs)?;
+        let v = self.v_proj.forward(xs)?;
+        let q = q
+            .reshape((batch, seq, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((batch, seq, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch, seq, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let q = rope.apply_positions(&q, positions)?;
+        let k = rope.apply_positions(&k, positions)?;
+        // Post-RoPE K, same rule as the single-sequence path. Each cache stays
+        // its own length. The stacked tensor below is only the attention view.
+        for (index, cache) in caches.iter_mut().enumerate() {
+            let k_i = k.narrow(0, index, 1)?;
+            let v_i = v.narrow(0, index, 1)?;
+            cache.append(layer_idx, k_i, v_i)?;
+        }
+        let k = stack_cached_kv(caches, layer_idx, true)?;
+        let v = stack_cached_kv(caches, layer_idx, false)?;
+        let groups = self.num_heads / self.num_kv_heads;
+        let k = repeat_kv(&k, groups)?;
+        let v = repeat_kv(&v, groups)?;
+
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let scores = q
+            .matmul(&k.transpose(2, 3)?.contiguous()?)?
+            .affine(scale, 0.0)?;
+        let scores = scores.broadcast_add(mask)?;
+        let weights = candle_nn::ops::softmax_last_dim(&scores)?;
+        let mixed = weights.matmul(&v.contiguous()?)?;
+        mixed
+            .transpose(1, 2)?
+            .reshape((batch, seq, self.num_heads * self.head_dim))?
+            .apply(&self.o_proj)
+    }
+}
+
+/// Stack per-sequence K or V along the batch axis, padding the sequence axis
+/// on the right with zeros out to the longest cache.
+///
+/// Each stored tensor is `(1, heads, seq_i, head_dim)`. The result is
+/// `(batch, heads, max_seq, head_dim)`. Zeros are not a substitute for the
+/// mask: the caller still writes `-inf` over `seq_i..max_seq`. The zeros only
+/// give the matmul a rectangular layout.
+fn stack_cached_kv(caches: &[&mut KvCache], layer: usize, keys: bool) -> Result<Tensor> {
+    if caches.is_empty() {
+        bail!("no caches to stack");
+    }
+    let mut max_len = 0usize;
+    for cache in caches.iter() {
+        let tensor = if keys {
+            &cache.k[layer]
+        } else {
+            &cache.v[layer]
+        };
+        max_len = max_len.max(tensor.dim(2)?);
+    }
+    let mut parts = Vec::with_capacity(caches.len());
+    for cache in caches.iter() {
+        let tensor = if keys {
+            &cache.k[layer]
+        } else {
+            &cache.v[layer]
+        };
+        let len = tensor.dim(2)?;
+        if len == max_len {
+            parts.push(tensor.contiguous()?);
+            continue;
+        }
+        let (_batch, heads, _, dim) = tensor.dims4()?;
+        let pad = Tensor::zeros(
+            (1, heads, max_len - len, dim),
+            tensor.dtype(),
+            tensor.device(),
+        )?;
+        parts.push(Tensor::cat(&[tensor, &pad], 2)?.contiguous()?);
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 0)
 }
 
 /// Repeat each key/value head `n_rep` times along the head axis.
@@ -326,6 +488,27 @@ impl Layer {
         let residual = xs;
         let xs = self.input_norm.forward(xs)?;
         let xs = self.attn.forward(&xs, mask, rope, pos, cache, layer_idx)?;
+        let xs = (xs + residual)?;
+        let residual = &xs;
+        let xs = self.post_norm.forward(&xs)?;
+        let xs = self.mlp.forward(&xs)?;
+        xs + residual
+    }
+
+    fn forward_decode(
+        &self,
+        xs: &Tensor,
+        mask: &Tensor,
+        rope: &RotaryEmbedding,
+        positions: &[usize],
+        caches: &mut [&mut KvCache],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_norm.forward(xs)?;
+        let xs = self
+            .attn
+            .forward_decode(&xs, mask, rope, positions, caches, layer_idx)?;
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = self.post_norm.forward(&xs)?;
@@ -568,6 +751,106 @@ impl QwenModel {
     pub fn forward(&self, ids: &[u32], pos: usize, cache: &mut KvCache) -> Result<Tensor> {
         let hidden = self.forward_hidden_cached(ids, pos, cache)?;
         self.logits_from_last(&hidden)
+    }
+
+    /// Decode one new token for each cache, in one forward.
+    ///
+    /// `ids[i]` is the token appended to `caches[i]`. Its RoPE position is
+    /// that cache's length before the call, which is also the absolute
+    /// position [`Self::forward`] would use. Caches may differ in length.
+    /// They are padded on the sequence axis and the extra keys are masked
+    /// with [`f32::NEG_INFINITY`]. The returned tensor is `(batch, vocab)`,
+    /// one row of last-position logits per sequence.
+    ///
+    /// This does not prefill. A new sequence still runs [`Self::forward`] on
+    /// its prompt alone. Doing that per sequence is the known inefficiency:
+    /// the prompt matmul does not share a weight read with the decode batch
+    /// or with the other prompts. Iteration-level scheduling still overlaps
+    /// the *decode* steps, which is the bulk of a long generation.
+    pub fn forward_decode_batch(&self, ids: &[u32], caches: &mut [&mut KvCache]) -> Result<Tensor> {
+        if ids.is_empty() || ids.len() != caches.len() {
+            bail!(
+                "decode batch wants one token per cache, got {} tokens and {} caches",
+                ids.len(),
+                caches.len()
+            );
+        }
+        let mut positions = Vec::with_capacity(ids.len());
+        for cache in caches.iter() {
+            if cache.num_layers() != self.layers.len() {
+                bail!(
+                    "kv cache has {} layers, model has {}",
+                    cache.num_layers(),
+                    self.layers.len()
+                );
+            }
+            let pos = cache.seq_len();
+            if pos == 0 {
+                bail!("decode batch cache is empty; prefill with forward first");
+            }
+            self.check_pos(pos, 1)?;
+            positions.push(pos);
+        }
+        let input = Tensor::from_slice(ids, (ids.len(), 1), &self.device)?;
+        let mut xs = self.embed.forward(&input)?;
+        // Length after this token is appended. Every layer appends one, so the
+        // mask is the same shape throughout. `positions[i] + 1 == lengths[i]`.
+        let lengths: Vec<usize> = positions.iter().map(|pos| pos + 1).collect();
+        for (index, layer) in self.layers.iter().enumerate() {
+            let window = self.window_for_layer(index);
+            let mask = self.decode_batch_mask(&lengths, &positions, window)?;
+            xs = layer.forward_decode(&xs, &mask, &self.rope, &positions, caches, index)?;
+        }
+        let hidden = self.norm.forward(&xs)?;
+        self.logits_from_rows(&hidden)
+    }
+
+    /// Additive mask `(batch, 1, 1, max_kv)` for a one-token decode batch.
+    ///
+    /// Query `b` sits at absolute position `positions[b]`. Real keys are
+    /// `0..lengths[b]` (the cache prefix plus the token just appended). Indexes
+    /// at or past `lengths[b]` are padding and get [`f32::NEG_INFINITY`], which
+    /// softmax turns into a zero weight. Real keys use [`mask_value`], so a
+    /// sliding window blocks the far past the same way the single-sequence
+    /// mask does.
+    fn decode_batch_mask(
+        &self,
+        lengths: &[usize],
+        positions: &[usize],
+        window: Option<usize>,
+    ) -> Result<Tensor> {
+        let max_len = lengths.iter().copied().max().unwrap_or(0);
+        if max_len == 0 || lengths.len() != positions.len() {
+            bail!("decode batch mask has no keys");
+        }
+        let mut values = Vec::with_capacity(lengths.len() * max_len);
+        for (b, &len) in lengths.iter().enumerate() {
+            let query = positions[b];
+            for key in 0..max_len {
+                let value = if key >= len {
+                    f32::NEG_INFINITY
+                } else {
+                    mask_value(query, key, window)
+                };
+                values.push(value);
+            }
+        }
+        Tensor::from_vec(values, (lengths.len(), 1, 1, max_len), &self.device)?.to_dtype(self.dtype)
+    }
+
+    /// Last-position logits for every row, shape `(batch, vocab)`.
+    fn logits_from_rows(&self, hidden: &Tensor) -> Result<Tensor> {
+        let (batch, seq, _) = hidden.dims3()?;
+        let last = hidden
+            .narrow(1, seq - 1, 1)?
+            .reshape((batch, self.cfg.hidden_size))?;
+        match &self.head {
+            Head::Tied => {
+                let weight = self.embed.embeddings().t()?;
+                last.matmul(&weight)
+            }
+            Head::Separate(head) => last.apply(head),
+        }
     }
 
     fn logits_from_last(&self, hidden: &Tensor) -> Result<Tensor> {
@@ -875,6 +1158,207 @@ mod tests {
             assert!(
                 diff <= 1e-4,
                 "chunked decode sliding {sliding} max abs {diff}"
+            );
+        }
+    }
+
+    /// Eight prompts, different lengths, greedy. Each row of the decode batch
+    /// matches that prompt run alone, including under the sliding window.
+    #[test]
+    fn batched_outputs_equal_solo_outputs() {
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1],
+            vec![2, 3],
+            vec![4, 5, 6],
+            vec![7, 8, 1, 2],
+            vec![3, 3, 3, 3, 3],
+            vec![9, 1],
+            vec![2, 2, 4, 6, 8, 1],
+            vec![5],
+        ];
+        let steps = 4usize;
+        for sliding in [false, true] {
+            let model = patterned_model(sliding);
+            let mut worst = 0.0f32;
+            let mut solo_cache = Vec::new();
+            let mut solo_logits = Vec::new();
+            let mut solo_ids = Vec::new();
+            let mut batch_cache = Vec::new();
+            let mut batch_logits = Vec::new();
+            for prompt in &prompts {
+                let mut cache = KvCache::new(model.num_layers());
+                let logits = model
+                    .forward(prompt, 0, &mut cache)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                solo_cache.push(cache);
+                solo_logits.push(logits);
+                solo_ids.push(prompt.clone());
+
+                let mut cache = KvCache::new(model.num_layers());
+                let logits = model
+                    .forward(prompt, 0, &mut cache)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                batch_cache.push(cache);
+                batch_logits.push(logits);
+            }
+            for (i, (batch, solo)) in batch_logits.iter().zip(&solo_logits).enumerate() {
+                let diff = max_abs(batch, solo);
+                assert!(
+                    diff <= 1e-4,
+                    "prefill seq {i} sliding {sliding} max abs {diff}"
+                );
+                worst = worst.max(diff);
+            }
+
+            let mut generated = vec![Vec::new(); prompts.len()];
+            for step in 0..steps {
+                let mut next = Vec::with_capacity(prompts.len());
+                for i in 0..prompts.len() {
+                    let id = crate::greedy_token(&batch_logits[i]).unwrap();
+                    assert_eq!(
+                        id,
+                        crate::greedy_token(&solo_logits[i]).unwrap(),
+                        "sliding {sliding} step {step} seq {i}"
+                    );
+                    generated[i].push(id);
+                    solo_ids[i].push(id);
+                    next.push(id);
+                }
+                if step + 1 == steps {
+                    break;
+                }
+                let mut refs: Vec<&mut KvCache> = batch_cache.iter_mut().collect();
+                let rows = model
+                    .forward_decode_batch(&next, &mut refs)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap();
+                drop(refs);
+                for i in 0..prompts.len() {
+                    let solo = model
+                        .forward(&[next[i]], solo_cache[i].seq_len(), &mut solo_cache[i])
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    let full = model
+                        .last_logits(&solo_ids[i])
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    let diff = max_abs(&rows[i], &solo);
+                    let diff_full = max_abs(&solo, &full);
+                    assert!(
+                        diff <= 1e-4,
+                        "sliding {sliding} decode step {step} seq {i} batch vs solo {diff}"
+                    );
+                    assert!(
+                        diff_full <= 1e-4,
+                        "sliding {sliding} decode step {step} seq {i} solo vs full {diff_full}"
+                    );
+                    worst = worst.max(diff).max(diff_full);
+                    batch_logits[i] = rows[i].clone();
+                    solo_logits[i] = solo;
+                    assert_eq!(batch_cache[i].seq_len(), solo_cache[i].seq_len());
+                }
+            }
+            let params = crate::GenerateParams::greedy(steps);
+            for (i, prompt) in prompts.iter().enumerate() {
+                let alone = crate::generate(&model, prompt, &params, |_| Ok(Vec::new())).unwrap();
+                assert_eq!(
+                    generated[i], alone.tokens,
+                    "sliding {sliding} seq {i} vs generate"
+                );
+            }
+            eprintln!("batched_outputs_equal_solo_outputs sliding={sliding} max abs {worst}");
+        }
+    }
+
+    /// After one joint step, one sequence leaves. The other two stay on the
+    /// path they would have walked alone. This is the mask when the batch
+    /// changes shape between iterations.
+    #[test]
+    fn leaving_the_batch_does_not_change_the_sequences_that_stay() {
+        let model = patterned_model(true);
+        let prompts = [vec![1u32, 2, 3, 4, 5, 6], vec![7, 8], vec![9, 3, 1]];
+        let mut solo_cache = Vec::new();
+        let mut solo_logits = Vec::new();
+        let mut batch_cache = Vec::new();
+        let mut batch_logits = Vec::new();
+        for prompt in &prompts {
+            let mut cache = KvCache::new(model.num_layers());
+            solo_logits.push(
+                model
+                    .forward(prompt, 0, &mut cache)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+            );
+            solo_cache.push(cache);
+            let mut cache = KvCache::new(model.num_layers());
+            batch_logits.push(
+                model
+                    .forward(prompt, 0, &mut cache)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+            );
+            batch_cache.push(cache);
+        }
+        let first: Vec<u32> = batch_logits
+            .iter()
+            .map(|row| crate::greedy_token(row).unwrap())
+            .collect();
+        let mut refs: Vec<&mut KvCache> = batch_cache.iter_mut().collect();
+        let rows = model
+            .forward_decode_batch(&first, &mut refs)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        drop(refs);
+        for i in 0..prompts.len() {
+            let solo = model
+                .forward(&[first[i]], solo_cache[i].seq_len(), &mut solo_cache[i])
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let diff = max_abs(&rows[i], &solo);
+            assert!(diff <= 1e-4, "joint step seq {i} max abs {diff}");
+            solo_logits[i] = solo;
+            batch_logits[i] = rows[i].clone();
+        }
+        // Sequence 1 is finished. The next iteration is the other two only.
+        let stay = [0usize, 2];
+        let next: Vec<u32> = stay
+            .iter()
+            .map(|&i| crate::greedy_token(&batch_logits[i]).unwrap())
+            .collect();
+        let mut kept: Vec<&mut KvCache> = batch_cache
+            .iter_mut()
+            .enumerate()
+            .filter(|(index, _)| stay.contains(index))
+            .map(|(_, cache)| cache)
+            .collect();
+        // `filter` keeps source order, which is `stay` (0 then 2), so `kept`
+        // lines up with `next`.
+        let rows = model
+            .forward_decode_batch(&next, &mut kept)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        for ((row, &index), &id) in rows.iter().zip(&stay).zip(&next) {
+            let solo = model
+                .forward(&[id], solo_cache[index].seq_len(), &mut solo_cache[index])
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let diff = max_abs(row, &solo);
+            assert!(
+                diff <= 1e-4,
+                "after drop, seq {index} diverged from solo by {diff}"
             );
         }
     }
