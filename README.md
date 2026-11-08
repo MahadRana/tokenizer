@@ -42,3 +42,22 @@ enc.encode_batch(["hello", "world"], num_threads=4)
 `encode` matches tiktoken's default: a special token that was not allowed raises `ValueError`. `encode_batch` drops the GIL and encodes on a rayon pool.
 
 `scripts/gen_bench_corpus.py` writes a gitignored 100 MB file by repeating public-domain Gutenberg texts. `scripts/bench_vs_tiktoken.py` reports MB/s against tiktoken 0.14.0. Numbers from one machine are in `BENCHMARKS.md`.
+
+## Qwen2.5 forward pass
+
+`qwen-infer` is a separate workspace member. It is not a default member, so `cargo test` does not compile candle. `RankTokenizer::load_qwen` reads Hugging Face `tokenizer.json` (GPT-2 `bytes_to_unicode`, the Qwen regex, NFC, added tokens). The model is written against candle-nn. Weights come from hf-hub and stay in the hub cache.
+
+```bash
+cargo run --release -p qwen-infer -- "The capital of France is"
+```
+
+That encodes with our tokenizer, greedy-generates 20 tokens on CPU in f32, and decodes those 20 ids. It does not apply the chat template and it does not stop on eos.
+
+`cargo test` stays offline. The Qwen checks are ignored:
+
+```bash
+cargo test --release -- --ignored
+cargo test --release -p qwen-infer -- --ignored
+```
+
+The first command also runs the older cl100k ignored tests. It needs `book.txt` (gitignored) and `python3` with tiktoken 0.14.0. `qwen_tokenizer_matches_hf` downloads `tokenizer.json` with curl when the cached sha256 does not match. The second command downloads `Qwen/Qwen2.5-0.5B-Instruct` through hf-hub 1.0 (`HFClientSync`) and compares last-position logits and 20 greedy ids to `tests/fixtures/`. Those fixtures come from `scripts/gen_qwen_cases.py` (tokenizers 0.23.3) and `scripts/dump_qwen_reference.py` (torch 2.15.0+cpu, transformers 5.22.1, float32, eager attention).
