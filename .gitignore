@@ -1,3 +1,21 @@
 /target
 /text
 book.txt
+
+# A6: local Python build and the generated benchmark corpus
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+dist/
+*.so
+*.pyd
+bench-corpus.txt
+
+# cargo-fuzz writes these next to the target. The corpus is generated
+# locally and is not a source file. Crashes worth keeping are copied into
+# a regression test, not left in artifacts/.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
