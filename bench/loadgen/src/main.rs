@@ -18,11 +18,12 @@ async fn main() -> ExitCode {
     let mut max_tokens = 4u32;
     let mut model = "Qwen/Qwen2.5-0.5B-Instruct".to_string();
     let mut warmup = 1usize;
+    let mut mix = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: loadgen [--url URL] [--requests 8] [--rate 1] [--seed 1] [--prompt Hi] [--max-tokens 4] [--warmup 1] [--model ID]"
+                    "usage: loadgen [--url URL] [--requests 8] [--rate 1] [--seed 1] [--prompt Hi] [--max-tokens 4] [--warmup 1] [--model ID] [--workload mix]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -34,19 +35,31 @@ async fn main() -> ExitCode {
             "--max-tokens" => max_tokens = parse_num(&mut args, "--max-tokens"),
             "--model" => model = need(&mut args, "--model"),
             "--warmup" => warmup = parse_num(&mut args, "--warmup"),
+            "--workload" => {
+                let value = need(&mut args, "--workload");
+                if value != "mix" {
+                    eprintln!("--workload must be mix");
+                    return ExitCode::from(2);
+                }
+                mix = true;
+            }
             other => {
                 eprintln!("unknown argument {other}");
                 return ExitCode::from(2);
             }
         }
     }
+    let workload = if mix {
+        loadgen::Workload::Mix
+    } else {
+        loadgen::Workload::Fixed { prompt, max_tokens }
+    };
     let config = LoadConfig {
         url,
         requests,
         rate_per_sec: rate,
         seed,
-        prompt,
-        max_tokens,
+        workload,
         model,
         warmup,
     };
