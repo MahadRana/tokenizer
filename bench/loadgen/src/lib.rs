@@ -17,11 +17,65 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use hdrhistogram::Histogram;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::distr::Distribution;
 use rand::rngs::StdRng;
 use rand_distr::Exp;
 use reqwest::Client;
+
+/// One entry in the benchmark mix.
+///
+/// `prompt_tokens` is the chat-templated prompt, not the user string alone.
+/// The template is the Qwen2.5 default system line, then the user string,
+/// then `<|im_start|>assistant\n`. The user string is `"amber ".repeat(repeats)`,
+/// including the trailing space. Counts are from `RankTokenizer::load_qwen`
+/// `encode` (every special token allowed) on that full string:
+/// 2 repeats → 32, 34 → 64, 66 → 96, 98 → 128.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MixEntry {
+    pub repeats: usize,
+    pub prompt_tokens: u32,
+    pub max_tokens: u32,
+}
+
+pub const MIX: [MixEntry; 4] = [
+    MixEntry {
+        repeats: 2,
+        prompt_tokens: 32,
+        max_tokens: 32,
+    },
+    MixEntry {
+        repeats: 34,
+        prompt_tokens: 64,
+        max_tokens: 32,
+    },
+    MixEntry {
+        repeats: 66,
+        prompt_tokens: 96,
+        max_tokens: 32,
+    },
+    MixEntry {
+        repeats: 98,
+        prompt_tokens: 128,
+        max_tokens: 32,
+    },
+];
+
+/// User message for one mix entry. The trailing space is part of the token count.
+pub fn mix_user(repeats: usize) -> String {
+    "amber ".repeat(repeats)
+}
+
+/// Catalog index for each measured request.
+///
+/// This is a second `StdRng` seeded with `seed`, not the generator that draws
+/// Poisson gaps. The two streams do not consume each other's draws. The same
+/// seed always assigns the same prompts.
+pub fn mix_assignments(seed: u64, n: usize) -> Vec<usize> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..n).map(|_| rng.random_range(0..MIX.len())).collect()
+}
 
 /// Gaps, in seconds, before requests `1..count`. Request 0 is at t = 0.
 ///
@@ -44,7 +98,10 @@ pub fn poisson_gaps(rng: &mut StdRng, rate_per_sec: f64, count: usize) -> Result
     Ok(gaps)
 }
 
-/// Record latencies in microseconds. Bounds are 1 µs to 10 minutes, 3 sig figs.
+/// Record latencies in microseconds. Bounds are 1 µs to 30 minutes, 3 sig figs.
+///
+/// A queued request at this workload can run past ten minutes. Values above
+/// the bound would be clamped, which would understate p99.
 pub struct LatencyHistogram {
     inner: Histogram<u64>,
 }
@@ -52,12 +109,13 @@ pub struct LatencyHistogram {
 impl LatencyHistogram {
     pub fn new() -> Self {
         Self {
-            inner: Histogram::<u64>::new_with_bounds(1, 600_000_000, 3).expect("histogram bounds"),
+            inner: Histogram::<u64>::new_with_bounds(1, 1_800_000_000, 3)
+                .expect("histogram bounds"),
         }
     }
 
     pub fn record(&mut self, latency: Duration) {
-        let us = latency.as_micros().clamp(1, 600_000_000) as u64;
+        let us = latency.as_micros().clamp(1, 1_800_000_000) as u64;
         // Values inside the configured bounds do not fail `record`.
         let _ = self.inner.record(us);
     }
@@ -249,46 +307,61 @@ pub fn summarize(samples: &[Sample], wall: Duration) -> Report {
     }
 }
 
+/// What each request sends. `Mix` is the seeded benchmark distribution.
+/// `Fixed` is one string and one `max_tokens`, used by the mock test path
+/// and by a manual run.
+#[derive(Debug, Clone)]
+pub enum Workload {
+    Fixed { prompt: String, max_tokens: u32 },
+    Mix,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadConfig {
     pub url: String,
     pub requests: usize,
     pub rate_per_sec: f64,
     pub seed: u64,
-    pub prompt: String,
-    pub max_tokens: u32,
+    pub workload: Workload,
     pub model: String,
     /// Requests issued before the timed run. Their samples are dropped.
+    /// A mix warmup always sends the first catalog entry. It does not draw
+    /// from `mix_assignments`, so the measured plan depends only on `seed`
+    /// and `requests`.
     pub warmup: usize,
 }
 
 /// Open-loop run. Each request is its own task. The spawn moves owned data
 /// in (`async move`) because `tokio::spawn` requires `'static + Send`.
 pub async fn run_load(config: LoadConfig) -> Result<Report, String> {
+    // A saturated cell's last request waits out most of the queue. 180 s
+    // was shorter than that wait once outputs are ~32 tokens.
     let client = Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(900))
         .build()
         .map_err(|err| err.to_string())?;
+    let (warm_prompt, warm_tokens) = warmup_job(&config.workload);
     if config.warmup > 0 {
         let warm = one_request(
             &client,
             &config.url,
             &config.model,
-            &config.prompt,
-            config.max_tokens,
+            &warm_prompt,
+            warm_tokens,
         )
         .await;
         if let Some(err) = warm.error {
             return Err(format!("warmup failed: {err}"));
         }
     }
+    let jobs = measured_jobs(&config.workload, config.seed, config.requests);
     let mut rng = StdRng::seed_from_u64(config.seed);
     let gaps = poisson_gaps(&mut rng, config.rate_per_sec, config.requests)?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(config.requests.max(1));
     let origin = tokio::time::Instant::now();
     let wall_start = Instant::now();
     let mut cursor = Duration::ZERO;
-    for index in 0..config.requests {
+    for (index, (prompt, max_tokens)) in jobs.into_iter().enumerate() {
         if index > 0 {
             cursor += Duration::from_secs_f64(gaps[index - 1]);
         }
@@ -297,8 +370,6 @@ pub async fn run_load(config: LoadConfig) -> Result<Report, String> {
         let client = client.clone();
         let url = config.url.clone();
         let model = config.model.clone();
-        let prompt = config.prompt.clone();
-        let max_tokens = config.max_tokens;
         tokio::spawn(async move {
             tokio::time::sleep_until(when).await;
             let sample = one_request(&client, &url, &model, &prompt, max_tokens).await;
@@ -311,6 +382,26 @@ pub async fn run_load(config: LoadConfig) -> Result<Report, String> {
         samples.push(sample);
     }
     Ok(summarize(&samples, wall_start.elapsed()))
+}
+
+fn warmup_job(workload: &Workload) -> (String, u32) {
+    match workload {
+        Workload::Fixed { prompt, max_tokens } => (prompt.clone(), *max_tokens),
+        Workload::Mix => (mix_user(MIX[0].repeats), MIX[0].max_tokens),
+    }
+}
+
+fn measured_jobs(workload: &Workload, seed: u64, n: usize) -> Vec<(String, u32)> {
+    match workload {
+        Workload::Fixed { prompt, max_tokens } => vec![(prompt.clone(), *max_tokens); n],
+        Workload::Mix => mix_assignments(seed, n)
+            .into_iter()
+            .map(|index| {
+                let entry = &MIX[index];
+                (mix_user(entry.repeats), entry.max_tokens)
+            })
+            .collect(),
+    }
 }
 
 async fn one_request(
@@ -488,6 +579,20 @@ mod tests {
         sock.write_all(data.as_bytes()).await.unwrap();
         sock.write_all(b"\r\n").await.unwrap();
         sock.flush().await.unwrap();
+    }
+
+    #[test]
+    fn mix_assignment_replays_for_a_fixed_seed() {
+        assert_eq!(MIX.map(|entry| entry.prompt_tokens), [32, 64, 96, 128]);
+        assert!(MIX.iter().all(|entry| entry.max_tokens == 32));
+        assert_eq!(mix_user(2), "amber amber ");
+        let plan = mix_assignments(1, 50);
+        assert_eq!(plan, mix_assignments(1, 50));
+        assert_eq!(plan.len(), 50);
+        assert!(plan.iter().all(|index| *index < MIX.len()));
+        assert_ne!(plan, mix_assignments(2, 50));
+        // First eight draws of StdRng::seed_from_u64(1) over 0..4.
+        assert_eq!(&plan[..8], &[3, 3, 3, 2, 0, 1, 0, 0]);
     }
 
     #[test]
