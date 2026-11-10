@@ -1,14 +1,22 @@
-//! Block ids and the free list that hands them out.
-//!
-//! A paged KV cache is a fixed pool of blocks plus a table on each sequence.
-//! This file is the allocator for that pool. The tensors, the `index_select`
-//! gather, and the scheduler come next. They are not in this commit.
+//! Paged KV cache: a free-list of block ids and a fixed tensor pool.
 //!
 //! [`BlockId`] is a newtype around `u32`. A token id or a token position is
 //! also a `u32`, and passing one where a block id is required is E0308 until
 //! the caller writes [`BlockId`] explicitly. The free list is a stack: `alloc`
 //! pops, `free_block` pushes, both O(1). The block freed most recently is the
 //! next one handed out.
+//!
+//! The pool is one K tensor and one V tensor per layer, shaped
+//! `(num_blocks, BLOCK_SIZE, kv_heads, head_dim)`. A sequence stores
+//! [`PagedCache::block_table`], logical block to physical [`BlockId`]. It does
+//! not borrow the pool. A `&mut` from each cache back to the pool would alias
+//! the `Vec` of sequences (E0499). Indices are `Copy`.
+//!
+//! `Drop` for [`PagedCache`] cannot return those ids. It has no allocator.
+//! Debug builds assert the table is empty. The scheduler calls
+//! [`PagedCache::take_blocks`] and [`BlockAllocator::free_block`].
+
+use candle_core::{DType, Device, Result, Tensor, bail};
 
 /// Tokens in one physical block.
 ///
@@ -120,7 +128,7 @@ impl BlockAllocator {
 
     /// Push `id` back. A second push of the same id is an error and does not
     /// grow the stack.
-    pub fn free_block(&mut self, id: BlockId) -> Result<(), AllocError> {
+    pub fn free_block(&mut self, id: BlockId) -> std::result::Result<(), AllocError> {
         let Some(slot) = self.is_free.get_mut(id.index()) else {
             return Err(AllocError::Unknown(id));
         };
@@ -138,6 +146,289 @@ impl BlockAllocator {
 /// Zero when `len` is zero. Otherwise `ceil(len / BLOCK_SIZE)`.
 pub fn blocks_for_len(len: usize) -> usize {
     len.div_ceil(BLOCK_SIZE)
+}
+
+/// One sequence's map from logical block to physical [`BlockId`].
+///
+/// `seq_len` is how many tokens are stored. The table may be a block longer
+/// when the scheduler reserved the next token's slot before writing it.
+/// Gather reads the whole table. The mask hides columns at and past `seq_len`.
+pub struct PagedCache {
+    block_table: Vec<BlockId>,
+    seq_len: usize,
+    n_layers: usize,
+}
+
+impl PagedCache {
+    pub fn new(n_layers: usize) -> Self {
+        Self {
+            block_table: Vec::new(),
+            seq_len: 0,
+            n_layers,
+        }
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.n_layers
+    }
+
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.block_table.len()
+    }
+
+    pub fn block_table(&self) -> &[BlockId] {
+        &self.block_table
+    }
+
+    pub fn assign_blocks(&mut self, blocks: impl IntoIterator<Item = BlockId>) {
+        self.block_table.extend(blocks);
+    }
+
+    pub(crate) fn set_seq_len(&mut self, len: usize) {
+        debug_assert!(
+            len == 0 || blocks_for_len(len) <= self.block_table.len(),
+            "seq_len {len} does not fit in {} blocks",
+            self.block_table.len()
+        );
+        self.seq_len = len;
+    }
+
+    /// Detach every id and set `seq_len` to 0. The caller frees the ids.
+    pub fn take_blocks(&mut self) -> Vec<BlockId> {
+        self.seq_len = 0;
+        std::mem::take(&mut self.block_table)
+    }
+}
+
+impl Drop for PagedCache {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.block_table.is_empty(),
+            "PagedCache dropped with {} blocks still assigned; free them on the allocator",
+            self.block_table.len()
+        );
+    }
+}
+
+/// K and V for every layer, allocated once.
+///
+/// `k[layer]` and `v[layer]` are `(num_blocks, block_size, kv_heads, head_dim)`.
+/// Writes use [`Tensor::slice_set`](candle_core::Tensor::slice_set). Reads use
+/// [`Tensor::index_select`](candle_core::Tensor::index_select) on dimension 0.
+/// <https://docs.rs/candle-core/0.11.1/candle_core/struct.Tensor.html#method.index_select>
+pub struct PagedKvPool {
+    k: Vec<Tensor>,
+    v: Vec<Tensor>,
+    zero_block: Tensor,
+    num_blocks: usize,
+    block_size: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    n_layers: usize,
+    dtype: DType,
+    device: Device,
+}
+
+impl PagedKvPool {
+    pub fn new(
+        num_blocks: usize,
+        n_layers: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        if num_blocks == 0 || n_layers == 0 || kv_heads == 0 || head_dim == 0 {
+            bail!("paged kv pool has an empty dimension");
+        }
+        if u32::try_from(num_blocks).is_err() {
+            bail!("num_blocks does not fit in u32");
+        }
+        let block_size = BLOCK_SIZE;
+        let shape = (num_blocks, block_size, kv_heads, head_dim);
+        let zero_block = Tensor::zeros((1, block_size, kv_heads, head_dim), dtype, device)?;
+        let mut k = Vec::with_capacity(n_layers);
+        let mut v = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k.push(Tensor::zeros(shape, dtype, device)?);
+            v.push(Tensor::zeros(shape, dtype, device)?);
+        }
+        Ok(Self {
+            k,
+            v,
+            zero_block,
+            num_blocks,
+            block_size,
+            kv_heads,
+            head_dim,
+            n_layers,
+            dtype,
+            device: device.clone(),
+        })
+    }
+
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.n_layers
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    /// Bytes of K and V. The one-block zero tensor used on free is not included.
+    pub fn kv_bytes(&self) -> usize {
+        let one = self.k.first().map(Tensor::elem_count).unwrap_or(0);
+        one * self.dtype.size_in_bytes() * 2 * self.n_layers
+    }
+
+    /// Write `k` and `v` at absolute positions `pos..pos+seq`.
+    ///
+    /// Both tensors are `(1, kv_heads, seq, head_dim)`, which is the layout
+    /// attention produces after RoPE. The pool stores a block as
+    /// `(block, token, kv_heads, head_dim)`.
+    pub fn write_layer(
+        &self,
+        layer: usize,
+        table: &[BlockId],
+        pos: usize,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> Result<()> {
+        if layer >= self.n_layers {
+            bail!("kv pool layer {layer} is out of range ({})", self.n_layers);
+        }
+        write_tokens(
+            &self.k[layer],
+            self.block_size,
+            self.kv_heads,
+            self.head_dim,
+            table,
+            pos,
+            k,
+        )?;
+        write_tokens(
+            &self.v[layer],
+            self.block_size,
+            self.kv_heads,
+            self.head_dim,
+            table,
+            pos,
+            v,
+        )
+    }
+
+    /// `(1, kv_heads, table.len() * block_size, head_dim)` in block-table order.
+    pub fn gather_layer(&self, layer: usize, table: &[BlockId], keys: bool) -> Result<Tensor> {
+        if layer >= self.n_layers {
+            bail!("kv pool layer {layer} is out of range ({})", self.n_layers);
+        }
+        if table.is_empty() {
+            bail!("no blocks to gather");
+        }
+        let pool = if keys { &self.k[layer] } else { &self.v[layer] };
+        let ids: Vec<u32> = table.iter().copied().map(BlockId::as_u32).collect();
+        let index = Tensor::from_vec(ids, (table.len(),), &self.device)?;
+        let selected = pool.index_select(&index, 0)?;
+        let (n, block_size, kv_heads, head_dim) = selected.dims4()?;
+        selected
+            .reshape((n * block_size, kv_heads, head_dim))?
+            .transpose(0, 1)?
+            .unsqueeze(0)?
+            .contiguous()
+    }
+
+    /// Zero one physical block in every layer before the id is reused.
+    pub fn clear_block(&self, id: BlockId) -> Result<()> {
+        let index = id.index();
+        if index >= self.num_blocks {
+            bail!("{id} is outside the pool ({})", self.num_blocks);
+        }
+        for layer in 0..self.n_layers {
+            self.k[layer].slice_set(&self.zero_block, 0, index)?;
+            self.v[layer].slice_set(&self.zero_block, 0, index)?;
+        }
+        Ok(())
+    }
+}
+
+fn write_tokens(
+    pool: &Tensor,
+    block_size: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    table: &[BlockId],
+    pos: usize,
+    tokens: &Tensor,
+) -> Result<()> {
+    let (batch, heads, seq, dim) = tokens.dims4()?;
+    if batch != 1 || heads != kv_heads || dim != head_dim {
+        bail!(
+            "kv write shape {:?}, pool heads {kv_heads} dim {head_dim}",
+            tokens.shape()
+        );
+    }
+    if seq == 0 {
+        return Ok(());
+    }
+    let end = pos + seq;
+    let need = blocks_for_len(end);
+    if table.len() < need {
+        bail!(
+            "block table has {} blocks, write through token {end} needs {need}",
+            table.len()
+        );
+    }
+    let mut offset = 0;
+    while offset < seq {
+        let abs = pos + offset;
+        let logical = abs / block_size;
+        let within = abs % block_size;
+        let take = (block_size - within).min(seq - offset);
+        // (1, kv_heads, take, head_dim) -> (1, take, kv_heads, head_dim).
+        let rows = tokens
+            .narrow(2, offset, take)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        install_rows(pool, table[logical].index(), within, &rows)?;
+        offset += take;
+    }
+    Ok(())
+}
+
+/// Splice `rows` at token offset `within` inside physical block `block`.
+///
+/// `rows` is `(1, take, kv_heads, head_dim)`. A full block replaces the
+/// storage with one `slice_set`. A partial block is concatenated with the
+/// head and tail already stored, then written back. The read is a copy, so
+/// the write does not alias its source.
+fn install_rows(pool: &Tensor, block: usize, within: usize, rows: &Tensor) -> Result<()> {
+    let block_size = pool.dim(1)?;
+    let take = rows.dim(1)?;
+    let rows = rows.contiguous()?;
+    if within == 0 && take == block_size {
+        return pool.slice_set(&rows, 0, block);
+    }
+    let existing = pool.narrow(0, block, 1)?.contiguous()?;
+    let mut parts = Vec::new();
+    if within > 0 {
+        parts.push(existing.narrow(1, 0, within)?.contiguous()?);
+    }
+    parts.push(rows);
+    let tail = block_size - within - take;
+    if tail > 0 {
+        parts.push(existing.narrow(1, within + take, tail)?.contiguous()?);
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    let updated = Tensor::cat(&refs, 1)?.contiguous()?;
+    pool.slice_set(&updated, 0, block)
 }
 
 #[cfg(test)]
@@ -251,5 +542,84 @@ mod tests {
             }
         }
         assert_eq!(alloc.free_count(), alloc.capacity());
+    }
+
+    #[test]
+    fn gather_reads_back_what_write_stored() {
+        let kv_heads = 2usize;
+        let head_dim = 4usize;
+        let pool = PagedKvPool::new(4, 1, kv_heads, head_dim, DType::F32, &Device::Cpu).unwrap();
+        let mut alloc = BlockAllocator::new(4);
+        let mut cache = PagedCache::new(1);
+        cache.assign_blocks(alloc.alloc_n(2).unwrap());
+
+        let first = pattern_tokens(0, 10, kv_heads, head_dim);
+        let second = pattern_tokens(10, 10, kv_heads, head_dim);
+        pool.write_layer(0, cache.block_table(), 0, &first, &first)
+            .unwrap();
+        pool.write_layer(0, cache.block_table(), 10, &second, &second)
+            .unwrap();
+
+        let gathered = pool.gather_layer(0, cache.block_table(), true).unwrap();
+        assert_eq!(gathered.dims(), &[1, kv_heads, 32, head_dim]);
+        let flat = gathered
+            .reshape((kv_heads, 32, head_dim))
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+        for (head, head_row) in flat.iter().enumerate() {
+            for (token, token_row) in head_row.iter().enumerate() {
+                for (dim, got) in token_row.iter().enumerate() {
+                    let want = if token < 20 {
+                        pattern_value(token, head, dim)
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(*got, want, "head {head} token {token} dim {dim}");
+                }
+            }
+        }
+        let vflat = pool
+            .gather_layer(0, cache.block_table(), false)
+            .unwrap()
+            .reshape((kv_heads, 32, head_dim))
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+        assert_eq!(vflat[1][16][3], pattern_value(16, 1, 3));
+
+        let id = cache.block_table()[1];
+        pool.clear_block(id).unwrap();
+        let cleared = pool
+            .gather_layer(0, cache.block_table(), true)
+            .unwrap()
+            .reshape((kv_heads, 32, head_dim))
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+        assert_eq!(cleared[0][16][0], 0.0);
+        assert_eq!(cleared[0][9][1], pattern_value(9, 0, 1));
+
+        for id in cache.take_blocks() {
+            alloc.free_block(id).unwrap();
+        }
+        assert_eq!(alloc.free_count(), alloc.capacity());
+    }
+
+    fn pattern_value(token: usize, head: usize, dim: usize) -> f32 {
+        (token * 100 + head * 10 + dim) as f32
+    }
+
+    fn pattern_tokens(pos: usize, seq: usize, kv_heads: usize, head_dim: usize) -> Tensor {
+        let mut data = vec![0f32; kv_heads * seq * head_dim];
+        for head in 0..kv_heads {
+            for token in 0..seq {
+                for dim in 0..head_dim {
+                    let index = (head * seq + token) * head_dim + dim;
+                    data[index] = pattern_value(pos + token, head, dim);
+                }
+            }
+        }
+        Tensor::from_vec(data, (1, kv_heads, seq, head_dim), &Device::Cpu).unwrap()
     }
 }

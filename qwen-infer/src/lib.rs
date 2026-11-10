@@ -16,7 +16,9 @@ pub use generate::{
     generate_with,
 };
 pub use model::{Config, KvCache, QwenModel, tiny_model};
-pub use paged::{AllocError, BLOCK_SIZE, BlockAllocator, BlockId, blocks_for_len};
+pub use paged::{
+    AllocError, BLOCK_SIZE, BlockAllocator, BlockId, PagedCache, PagedKvPool, blocks_for_len,
+};
 pub use sample::{SampleError, greedy_token, sample_token};
 pub use stream::StreamDecoder;
 
