@@ -118,6 +118,74 @@ Single-thread on the corpus is **1.32×** tiktoken's time, inside the 1.5× targ
 
 A separate pytest on a synthetic list (64 copies of a ~60 KB sentence, minimum of 3 runs) measured `encode_batch(..., num_threads=8)` at 0.124 s, the 1-thread batch at 0.302 s, and a Python loop of `encode` at 0.293 s. A watcher thread recorded 33 GIL acquisitions during a 0.400 s `encode_batch` (`time.sleep(0.01)` in that thread). Those are one pytest run, not the tables above.
 
+### Book encode after the piece fast path
+
+The tables above are the 2026-11-04 measurement, before this change. Remeasured 2026-11-10 on `feat/a6-encode-perf`, rustc 1.99.1 (58cf8f9c3 2026-10-13), Python 3.12.3, maturin 1.16.0, tiktoken 0.14.0. Same machine class as the B6 rows.
+
+- Linux 6.12.113+ x86_64, KVM guest
+- 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores.
+- MemTotal 16,387,328 kB
+
+`scripts/bench_vs_tiktoken.py` on `book.txt` only (772,386 bytes, 177,179 tokens, ids checked against tiktoken before the clock). Means of 5. The corpus file was not in this run. MB/s is bytes / 1e6 / seconds. The ratio is our wall time divided by tiktoken.
+
+A split of one release `encode` of the book, before the change: the cl100k regex `find_iter` was about 28 ms, and `encode_piece` on the 162,624 pieces was about 41 ms. 151,179 of those pieces (674,292 bytes) were already a single vocab token and cost about 34 ms. The other 11,445 pieces cost about 6 ms. No piece was longer than 67 bytes. The merge loop on tokens the vocab already contains was the gap. The change emits that id directly for a `load_cl100k` tokenizer. `encode_bpe` is unchanged, and the vocab round-trip test still runs the merge loop on every token. A parsed vocab that is not cl100k does not take the shortcut.
+
+Before, same command, this machine:
+
+| | mahad_tok | tiktoken 0.14.0 | time ratio |
+|---|---|---|---|
+| single-thread | **10.480 MB/s** (0.074 s) | **19.950 MB/s** (0.039 s) | **1.904×** |
+| batch, 1 thread | 10.343 MB/s (0.075 s) | 14.451 MB/s (0.053 s) | 1.397× |
+| batch, 4 threads | 31.073 MB/s (0.025 s) | 49.002 MB/s (0.016 s) | 1.577× |
+| batch, 8 threads | 27.334 MB/s (0.028 s) | 40.234 MB/s (0.019 s) | 1.472× |
+
+Before samples, seconds. Ours then tiktoken.
+
+- single-thread: 0.0731, 0.0761, 0.0728, 0.0730, 0.0734 and 0.0387, 0.0378, 0.0379, 0.0416, 0.0375
+- batch 1: 0.0753, 0.0738, 0.0743, 0.0743, 0.0757 and 0.0531, 0.0516, 0.0520, 0.0520, 0.0585
+- batch 4: 0.0259, 0.0249, 0.0246, 0.0246, 0.0242 and 0.0165, 0.0155, 0.0156, 0.0153, 0.0159
+- batch 8: 0.0333, 0.0290, 0.0254, 0.0271, 0.0264 and 0.0210, 0.0192, 0.0208, 0.0193, 0.0157
+
+After, a quiet run of the same book timing, once the machine was otherwise idle:
+
+| | mahad_tok | tiktoken 0.14.0 | time ratio |
+|---|---|---|---|
+| single-thread | **18.100 MB/s** (0.043 s) | **20.232 MB/s** (0.038 s) | **1.118×** |
+| batch, 1 thread | 17.794 MB/s (0.043 s) | 15.095 MB/s (0.051 s) | 0.848× |
+| batch, 4 threads | 44.573 MB/s (0.017 s) | 49.249 MB/s (0.016 s) | 1.105× |
+| batch, 8 threads | 40.731 MB/s (0.019 s) | 38.553 MB/s (0.020 s) | 0.947× |
+
+After samples, seconds. Ours then tiktoken.
+
+- single-thread: 0.0424, 0.0420, 0.0448, 0.0419, 0.0423 and 0.0389, 0.0386, 0.0373, 0.0387, 0.0373
+- batch 1: 0.0428, 0.0422, 0.0422, 0.0480, 0.0419 and 0.0532, 0.0510, 0.0504, 0.0511, 0.0502
+- batch 4: 0.0179, 0.0175, 0.0168, 0.0169, 0.0176 and 0.0161, 0.0160, 0.0153, 0.0155, 0.0155
+- batch 8: 0.0185, 0.0203, 0.0197, 0.0183, 0.0180 and 0.0214, 0.0202, 0.0205, 0.0189, 0.0192
+
+An earlier quiet run of the same function was single-thread **18.250 MB/s** (0.042 s) against **19.772 MB/s** (0.039 s), **1.083×**. Samples: 0.0424, 0.0428, 0.0425, 0.0419, 0.0420 and 0.0399, 0.0390, 0.0390, 0.0389, 0.0386.
+
+`scripts/bench_vs_tiktoken.py` with the corpus file present printed a book single-thread mean of **15.448 MB/s** (0.050 s) against **19.789 MB/s** (0.039 s), **1.281×**. The first of our five samples was 0.0644 s. The other four were 0.0494, 0.0457, 0.0452, 0.0454. That run is under 1.5× too. The quiet means above are the steady rate. 18.100 / 10.480 = 1.73× the earlier MB/s on this boot.
+
+The same script invocation timed the new corpus. `scripts/gen_bench_corpus.py` downloaded the ten Gutenberg ids and wrote `bench-corpus.txt` at **106,108,750** bytes (the 2026-11-04 file was 106,109,010; this download is 260 bytes shorter). 36,411,750 tokens, checked against tiktoken before the clock. Means of 2. There is no before row for this exact file.
+
+| | mahad_tok | tiktoken 0.14.0 | time ratio |
+|---|---|---|---|
+| single-thread | **10.784 MB/s** (9.839 s) | **14.681 MB/s** (7.228 s) | **1.361×** |
+| batch, 1 thread | 10.439 MB/s (10.165 s) | 10.313 MB/s (10.289 s) | 0.988× |
+| batch, 4 threads | 27.756 MB/s (3.823 s) | 31.601 MB/s (3.358 s) | 1.139× |
+| batch, 8 threads | 26.628 MB/s (3.985 s) | 25.638 MB/s (4.139 s) | 0.963× |
+
+Corpus samples, seconds. Ours then tiktoken.
+
+- single-thread: 10.1769, 9.5020 and 7.2049, 7.2509
+- batch 1: 10.2688, 10.0607 and 11.6628, 8.9157
+- batch 4: 3.8518, 3.7942 and 2.6494, 4.0661
+- batch 8: 4.0850, 3.8848 and 3.0475, 5.2301
+
+Single-thread on the book is **1.118×** tiktoken on the quiet run, and **1.281×** on the script run that included the 0.0644 s sample. Both are inside the 1.5× target. The corpus single-thread row is **1.361×**, also inside. The corpus has more pieces that are not already one token, so the shortcut covers less of that file than it does of the book.
+
+Criterion `cl100k_encode/book`, same binary, flags `--warm-up-time 1 --measurement-time 5 --sample-size 50`. Before: **70.242 ms** (69.746–70.861 ms), **10.487 MiB/s** (10.395–10.561). After: **39.244 ms** (38.917–39.604 ms), **18.770 MiB/s** (18.599–18.927). 772,386 / 0.039244 s = **19.68 MB/s** at 10^6 bytes per MB. The first criterion pass on this boot was taken while another compile was running and is not the before number.
+
 ## B1: Qwen2.5-0.5B greedy on CPU
 
 Not the training command. `cargo run --release -p qwen-infer -- "The capital of France is"` encodes with `RankTokenizer::load_qwen`, then takes 20 greedy steps. Each step runs the full sequence. There is no KV cache. The clock starts after the weights are loaded and stops after the 20th id. The continuation was ` Paris. It is the largest city in Europe and the third largest city in the world. It is`, the same 20 ids as the transformers float32 eager dump.
@@ -296,7 +364,7 @@ The 0.06 cells take about 14 minutes each because the arrivals themselves span `
 | B5 paged | 0.5 req/s | 8 | 50 | 15.1789 | 0.4743 | 0.504 s | 2.738 s | 0.132 s | 0.708 s | 9.978 s |
 | B5 paged | 1.0 req/s | 8 | 50 | 24.0145 | 0.7505 | 7.950 s | 12.255 s | 0.206 s | 1.148 s | 21.365 s |
 
-Saturation here means the achieved request rate falls behind the offer, or TTFT p50 jumps. No batching does that at **0.25 req/s**: achieved 0.1571 against 0.25, and TTFT p50 goes from 0.539 s to 68.092 s. At 0.06 req/s it was still keeping up (0.0587 against 0.06). B4 and B5 do not do that at 0.5 req/s. Achieved rates are 0.4735 and 0.4743 against 0.5, TTFT p50 stays at 0.579 s and 0.504 s, and output rate is still climbing (7.76 to 15.15 tok/s for B4, 7.77 to 15.18 for B5). Both saturate at **1.0 req/s**. B4 achieves 0.8149 against 1.0 and TTFT p50 jumps to 5.026 s. B5 achieves 0.7505 against 1.0 and TTFT p50 jumps to 7.950 s. Nothing between 0.5 and 1.0 was measured, so the point named above is the first measured offer where that happened, not a fitted knee.
+Saturation here means the achieved request rate falls behind the offer, or TTFT p50 jumps. No batching does that at **0.25 req/s**: achieved 0.1571 against 0.25, and TTFT p50 goes from 0.539 s to 68.092 s. At 0.06 req/s it was still keeping up (0.0587 against 0.06). B4 and B5 do not do that at 0.5 req/s. Achieved rates are 0.4735 and 0.4743 against 0.5, TTFT p50 stays at 0.579 s and 0.504 s, and output rate is still climbing (7.76 to 15.15 tok/s for B4, 7.77 to 15.18 for B5). Both saturate at **1.0 req/s**. B4 achieves 0.8149 against 1.0 and TTFT p50 jumps to 5.026 s. B5 achieves 0.7505 against 1.0 and TTFT p50 jumps to 7.950 s. Nothing between 0.5 and 1.0 was measured, so the point named above is the first measured offer where that happened, not a fitted knee. In this load test, B5 paged is slightly behind B4 contiguous at 1.0 req/s (unprofiled), and the large gain comes from batching, not paging.
 
 The tok/s gap at 0.06 (1.88 vs 1.90) is the idle time, not the engine. CSV: `bench/results/b6-ttft-curve.csv`. Each `#` is about 1 s of p99 TTFT. The saturated no-batching cell and the 1.0 req/s p99s are past a 16 s scale, so those p99s are written as numbers.
 
