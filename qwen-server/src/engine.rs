@@ -1,10 +1,14 @@
-//! One OS thread owns the model and every live [`Sequence`].
+//! One OS thread owns the model, the paged KV pool, and every live [`Sequence`].
 //!
 //! Handlers never call `forward`. They reserve a slot and enqueue a
 //! [`GenRequest`]. The engine drains that queue, admits from a FIFO waiting
-//! deque while the running batch has room, and runs one iteration: prefill
-//! each new sequence on its own, then one batched decode of the sequences
-//! that already have a cache. Tokens go out on the per-request
+//! deque while the running batch has room and the free stack can cover the
+//! prompt, and runs one iteration: prefill each new sequence on its own,
+//! restore any sequence whose blocks were taken back, then one batched decode.
+//! K and V live in one [`qwen_infer::PagedKvPool`]. A sequence holds block ids.
+//! When the next token needs a block and the stack is empty, the newest
+//! sequence is preempted: its blocks return to the stack and it is recomputed
+//! from the tokens it already sampled. Tokens go out on the per-request
 //! `tokio::sync::mpsc` channel. `try_send` is attempted once per sequence
 //! per iteration. A full channel parks that sequence; it does not sleep the
 //! thread. A dropped receiver, or a client that stays full past
@@ -22,7 +26,10 @@
 
 use crate::TokenCodec;
 use crate::error::ApiError;
-use qwen_infer::{Control, GenerateParams, KvCache, SampleCursor, SampleNext, StopReason};
+use qwen_infer::{
+    BLOCK_SIZE, BlockAllocator, Control, GenerateParams, PagedCache, PagedKvPool, SampleCursor,
+    SampleNext, StopReason, blocks_for_len,
+};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
@@ -68,6 +75,10 @@ pub struct EngineStats {
     pub token_channel_full: u64,
     /// Largest running batch this process has admitted.
     pub max_running: u64,
+    /// Times a running sequence lost its blocks so another sequence could grow.
+    pub preemptions: u64,
+    /// Id of the sequence most recently preempted. Zero when none has been.
+    pub last_preempted_id: u64,
 }
 
 pub struct GenRequest {
@@ -158,7 +169,12 @@ struct Sequence {
     id: u64,
     /// Sampled ids, excluding EOS. Kept in step with [`SampleCursor::tokens`].
     tokens: Vec<u32>,
-    cache: KvCache,
+    cache: PagedCache,
+    /// Blocks required before this sequence may leave the waiting deque.
+    /// A new request needs its prompt. After preemption the count also covers
+    /// the token already sampled and not yet written, so the next iteration
+    /// does not evict the same sequence again.
+    admit_blocks: usize,
     tx: mpsc::Sender<GenUpdate>,
     params: GenerateParams,
     prompt: Vec<u32>,
@@ -190,6 +206,11 @@ enum Phase {
     Prefill,
     /// Next iteration forwards this one token at `cache.seq_len()`.
     Decode(u32),
+    /// Blocks were taken back after `pending` had already been sampled.
+    /// The next forward writes `prompt` plus every sampled token except
+    /// `pending`, and does not sample again. The phase then becomes
+    /// [`Phase::Decode`].
+    Restore { pending: u32 },
 }
 
 enum Outcome {
@@ -200,6 +221,7 @@ enum Outcome {
     Failed,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn engine_thread(
     rx: Receiver<GenRequest>,
     model: qwen_infer::QwenModel,
@@ -208,12 +230,15 @@ pub fn engine_thread(
     stats: Arc<Mutex<EngineStats>>,
     inflight: Arc<AtomicUsize>,
     max_batch_size: usize,
+    pool: PagedKvPool,
 ) {
     let mut waiting: VecDeque<Sequence> = VecDeque::new();
     let mut running: Vec<Sequence> = Vec::new();
     let mut next_id = 1u64;
     let mut ingress_closed = false;
     let layers = model.num_layers();
+    let capacity = u32::try_from(pool.num_blocks()).expect("pool blocks fit in u32");
+    let mut alloc = BlockAllocator::new(capacity);
 
     loop {
         if shutdown.load(Ordering::SeqCst) || ingress_closed {
@@ -249,13 +274,17 @@ pub fn engine_thread(
             }
         }
 
-        // FIFO. A sequence waits only while the running batch is full.
-        while running.len() < max_batch_size {
-            let Some(seq) = waiting.pop_front() else {
-                break;
-            };
-            running.push(seq);
-        }
+        // FIFO, and only while a batch slot and enough free blocks are both free.
+        // A later, smaller request does not skip a sequence waiting on memory.
+        admit(
+            &mut waiting,
+            &mut running,
+            &mut alloc,
+            max_batch_size,
+            &shutdown,
+            &stats,
+            &inflight,
+        );
         {
             let mut guard = stats.lock().expect("engine stats");
             guard.active = !running.is_empty();
@@ -274,7 +303,7 @@ pub fn engine_thread(
         // and is not forwarded.
         mark_closed(&mut running);
         flush_all(&mut running, &shutdown, &stats);
-        evict_finished(&mut running, &inflight, &stats);
+        evict_finished(&mut running, &mut alloc, &pool, &inflight, &stats);
         if running.is_empty() {
             stats.lock().expect("engine stats").active = false;
             if ingress_closed {
@@ -307,8 +336,34 @@ pub fn engine_thread(
             continue;
         }
 
-        step_batch(&model, codec.as_ref(), &mut running, &shutdown, &stats);
-        evict_finished(&mut running, &inflight, &stats);
+        let mut deferred = VecDeque::new();
+        reserve_blocks(
+            &mut running,
+            &mut deferred,
+            &mut alloc,
+            &pool,
+            &shutdown,
+            &stats,
+        );
+        if running.iter().any(can_forward) {
+            step_batch(
+                &model,
+                &pool,
+                codec.as_ref(),
+                &mut running,
+                &shutdown,
+                &stats,
+            );
+        }
+        evict_finished(&mut running, &mut alloc, &pool, &inflight, &stats);
+        // Oldest preempted sequence is admitted first, ahead of requests that
+        // have not run. This happens after admission for this iteration, so a
+        // sequence is not evicted and restored in the same step.
+        let mut victims: Vec<Sequence> = deferred.drain(..).collect();
+        victims.sort_by_key(|seq| seq.id);
+        for seq in victims.into_iter().rev() {
+            waiting.push_front(seq);
+        }
         stats.lock().expect("engine stats").active = !running.is_empty();
     }
 
@@ -317,12 +372,16 @@ pub fn engine_thread(
         inflight.fetch_sub(1, Ordering::AcqRel);
         drop(req);
     }
-    for seq in waiting.drain(..) {
-        abandon(seq, &inflight, &stats);
+    let mut leftover: Vec<Sequence> = waiting.drain(..).collect();
+    leftover.append(&mut running);
+    for seq in leftover {
+        abandon(seq, &mut alloc, &pool, &inflight, &stats);
     }
-    for seq in running.drain(..) {
-        abandon(seq, &inflight, &stats);
-    }
+    assert_eq!(
+        alloc.free_count(),
+        alloc.capacity(),
+        "kv blocks still assigned after the engine stopped"
+    );
     stats.lock().expect("engine stats").active = false;
 }
 
@@ -355,10 +414,12 @@ fn accept(
         }
     };
     let prompt_tokens = u32::try_from(req.prompt_ids.len()).unwrap_or(u32::MAX);
+    let admit_blocks = blocks_for_len(req.prompt_ids.len());
     Some(Sequence {
         id,
         tokens: Vec::new(),
-        cache: KvCache::new(layers),
+        cache: PagedCache::new(layers),
+        admit_blocks,
         tx: req.tx,
         params: req.params,
         prompt: req.prompt_ids,
@@ -375,16 +436,231 @@ fn accept(
     })
 }
 
-/// Prefill every new sequence by itself, then decode the rest as one batch.
+/// Admit from `waiting` while the batch has a slot and the free stack covers
+/// `admit_blocks`. A prompt that cannot fit even in an empty pool is failed.
+fn admit(
+    waiting: &mut VecDeque<Sequence>,
+    running: &mut Vec<Sequence>,
+    alloc: &mut BlockAllocator,
+    max_batch_size: usize,
+    shutdown: &AtomicBool,
+    stats: &Mutex<EngineStats>,
+    inflight: &AtomicUsize,
+) {
+    while running.len() < max_batch_size {
+        let Some(needed) = waiting.front().map(|seq| seq.admit_blocks) else {
+            break;
+        };
+        if needed > alloc.capacity() {
+            let mut seq = waiting.pop_front().expect("front");
+            let message = format!(
+                "kv pool has {} blocks of {BLOCK_SIZE}; this sequence needs {}",
+                alloc.capacity(),
+                seq.admit_blocks
+            );
+            fail_sequence(&mut seq, &message, shutdown, stats);
+            if seq.outcome.is_some() {
+                retire(seq, inflight, stats, !running.is_empty());
+            } else {
+                running.push(seq);
+            }
+            continue;
+        }
+        if alloc.free_count() < needed {
+            break;
+        }
+        let mut seq = waiting.pop_front().expect("front");
+        let ids = alloc
+            .alloc_n(seq.admit_blocks)
+            .expect("free_count was checked");
+        debug_assert_eq!(seq.cache.block_count(), 0);
+        seq.cache.assign_blocks(ids);
+        running.push(seq);
+    }
+}
+
+/// Give every runnable sequence the blocks its next forward needs.
 ///
-/// Prefill is the known inefficiency. Prompts differ in length, and this
-/// loop does not pack them into one matmul. A new sequence is sampled from
-/// its prompt logits in this same iteration; the token it just drew is
-/// forwarded on the next iteration, with whoever else is still running.
-/// Shutdown cannot cut the forwards short. The flag is read after those
-/// forwards return, when the new update is flushed.
+/// Oldest id first. When the free stack runs out, the newest sequence that
+/// is still generating is preempted. A sequence that cannot fit in the pool
+/// at all is failed instead of being evicted forever.
+fn reserve_blocks(
+    running: &mut Vec<Sequence>,
+    deferred: &mut VecDeque<Sequence>,
+    alloc: &mut BlockAllocator,
+    pool: &PagedKvPool,
+    shutdown: &AtomicBool,
+    stats: &Mutex<EngineStats>,
+) {
+    // A sequence waiting to deliver Done or Failed will not forward again.
+    // Drop its blocks here so they are not stuck behind that send, and so
+    // `newest_preemptable` does not have to evict it to free them.
+    for seq in running.iter_mut() {
+        if has_pending_terminal(seq) {
+            free_cache(seq, alloc, pool);
+        }
+    }
+    loop {
+        let Some(index) = grow_runnable(running, alloc) else {
+            return;
+        };
+        let need = blocks_for_step(&running[index]);
+        if need > alloc.capacity() {
+            fail_short(running, index, alloc, pool, shutdown, stats);
+            continue;
+        }
+        let Some(victim) = newest_preemptable(running) else {
+            fail_short(running, index, alloc, pool, shutdown, stats);
+            return;
+        };
+        preempt_at(running, victim, alloc, pool, deferred, stats);
+    }
+}
+
+fn grow_runnable(running: &mut [Sequence], alloc: &mut BlockAllocator) -> Option<usize> {
+    let mut order: Vec<usize> = (0..running.len())
+        .filter(|&index| can_forward(&running[index]))
+        .collect();
+    order.sort_by_key(|&index| running[index].id);
+    for index in order {
+        let need = blocks_for_step(&running[index]);
+        let have = running[index].cache.block_count();
+        if have >= need {
+            continue;
+        }
+        let extra = need - have;
+        if alloc.free_count() < extra {
+            return Some(index);
+        }
+        let ids = alloc.alloc_n(extra).expect("free_count was checked");
+        running[index].cache.assign_blocks(ids);
+    }
+    None
+}
+
+/// A `Done` or `Failed` still sitting in `pending` means generation is over.
+/// Evicting that sequence would drop the KV and later restore it, which can
+/// sample again or emit the terminal update twice. Those sequences are not
+/// victims. Their blocks are released separately, without a recompute.
+fn has_pending_terminal(seq: &Sequence) -> bool {
+    seq.held_outcome.is_some()
+        || seq
+            .pending
+            .iter()
+            .any(|update| matches!(update, GenUpdate::Done(_) | GenUpdate::Failed(_)))
+}
+
+fn newest_preemptable(running: &[Sequence]) -> Option<usize> {
+    running
+        .iter()
+        .enumerate()
+        .filter(|(_, seq)| seq.outcome.is_none() && !has_pending_terminal(seq))
+        .max_by_key(|(_, seq)| seq.id)
+        .map(|(index, _)| index)
+}
+
+fn preempt_at(
+    running: &mut Vec<Sequence>,
+    index: usize,
+    alloc: &mut BlockAllocator,
+    pool: &PagedKvPool,
+    deferred: &mut VecDeque<Sequence>,
+    stats: &Mutex<EngineStats>,
+) {
+    let mut seq = running.swap_remove(index);
+    debug_assert_cache(&seq);
+    let resume = resume_blocks(&seq);
+    free_cache(&mut seq, alloc, pool);
+    seq.phase = match seq.phase {
+        Phase::Prefill => Phase::Prefill,
+        Phase::Decode(pending) | Phase::Restore { pending } => Phase::Restore { pending },
+    };
+    seq.admit_blocks = resume;
+    {
+        let mut guard = stats.lock().expect("engine stats");
+        guard.preemptions += 1;
+        guard.last_preempted_id = seq.id;
+    }
+    eprintln!(
+        "engine id {} preempted; resume {} blocks",
+        seq.id, seq.admit_blocks
+    );
+    deferred.push_front(seq);
+}
+
+fn fail_short(
+    running: &mut [Sequence],
+    index: usize,
+    alloc: &mut BlockAllocator,
+    pool: &PagedKvPool,
+    shutdown: &AtomicBool,
+    stats: &Mutex<EngineStats>,
+) {
+    let need = blocks_for_step(&running[index]);
+    let message = format!(
+        "kv pool has {} blocks of {BLOCK_SIZE}; this sequence needs {need}",
+        alloc.capacity()
+    );
+    free_cache(&mut running[index], alloc, pool);
+    fail_sequence(&mut running[index], &message, shutdown, stats);
+}
+
+fn blocks_for_step(seq: &Sequence) -> usize {
+    let len = match seq.phase {
+        Phase::Prefill => seq.prompt.len(),
+        Phase::Decode(_) => seq.cache.seq_len() + 1,
+        Phase::Restore { .. } => seq.prompt.len() + seq.tokens.len().saturating_sub(1),
+    };
+    blocks_for_len(len)
+}
+
+fn resume_blocks(seq: &Sequence) -> usize {
+    match seq.phase {
+        Phase::Prefill => blocks_for_len(seq.prompt.len()),
+        Phase::Decode(_) | Phase::Restore { .. } => {
+            let restore = seq.prompt.len() + seq.tokens.len().saturating_sub(1);
+            blocks_for_len(restore + 1)
+        }
+    }
+}
+
+fn debug_assert_cache(seq: &Sequence) {
+    match seq.phase {
+        Phase::Prefill => debug_assert_eq!(seq.cache.seq_len(), 0),
+        Phase::Decode(pending) => {
+            let expected = seq.prompt.len() + seq.tokens.len().saturating_sub(1);
+            debug_assert_eq!(seq.cache.seq_len(), expected, "id {}", seq.id);
+            debug_assert_eq!(seq.tokens.last().copied(), Some(pending));
+        }
+        Phase::Restore { pending } => {
+            debug_assert_eq!(seq.cache.seq_len(), 0);
+            debug_assert_eq!(seq.tokens.last().copied(), Some(pending));
+        }
+    }
+}
+
+fn free_cache(seq: &mut Sequence, alloc: &mut BlockAllocator, pool: &PagedKvPool) {
+    for id in seq.cache.take_blocks() {
+        if let Err(err) = pool.clear_block(id) {
+            eprintln!("engine id {} clear {id}: {err}", seq.id);
+        }
+        if let Err(err) = alloc.free_block(id) {
+            eprintln!("engine id {} {err}", seq.id);
+            if cfg!(debug_assertions) {
+                panic!("engine id {} {err}", seq.id);
+            }
+        }
+    }
+}
+
+/// Prefill new sequences, restore preempted ones, then decode the rest.
+///
+/// Prefill is still one prompt at a time. A restore writes the prefix back
+/// and does not sample. The prompt ids stay on the sequence: a preemption
+/// has to recompute them, so [`std::mem::take`] would throw them away.
 fn step_batch(
     model: &qwen_infer::QwenModel,
+    pool: &PagedKvPool,
     codec: &dyn TokenCodec,
     running: &mut Vec<Sequence>,
     shutdown: &AtomicBool,
@@ -392,40 +668,44 @@ fn step_batch(
 ) {
     let mut parked = Vec::new();
     let mut prefilling = Vec::new();
+    let mut restoring = Vec::new();
     let mut decoding = Vec::new();
     for seq in running.drain(..) {
-        // Output-blocked sequences are not forwarded. Their unsent update is
-        // retried by `flush_all` on the next iteration, once, with everyone else.
         if seq.outcome.is_some() || !seq.pending.is_empty() {
             parked.push(seq);
             continue;
         }
         match seq.phase {
             Phase::Prefill => prefilling.push(seq),
+            Phase::Restore { .. } => restoring.push(seq),
             Phase::Decode(_) => decoding.push(seq),
         }
     }
     for seq in &mut prefilling {
-        prefill_one(model, codec, seq, shutdown, stats);
+        prefill_one(model, pool, codec, seq, shutdown, stats);
+    }
+    for seq in &mut restoring {
+        restore_one(model, pool, seq, shutdown, stats);
     }
     if !decoding.is_empty() {
-        decode_group(model, codec, &mut decoding, shutdown, stats);
+        decode_group(model, pool, codec, &mut decoding, shutdown, stats);
     }
     running.extend(parked);
     running.extend(decoding);
+    running.extend(restoring);
     running.extend(prefilling);
 }
 
 fn prefill_one(
     model: &qwen_infer::QwenModel,
+    pool: &PagedKvPool,
     codec: &dyn TokenCodec,
     seq: &mut Sequence,
     shutdown: &AtomicBool,
     stats: &Mutex<EngineStats>,
 ) {
-    let prompt = std::mem::take(&mut seq.prompt);
     let started = Instant::now();
-    let forwarded = model.forward(&prompt, 0, &mut seq.cache);
+    let forwarded = model.forward_paged(&seq.prompt, 0, &mut seq.cache, pool);
     seq.prefill = started.elapsed();
     match forwarded {
         Ok(logits) => match logits.to_vec1::<f32>() {
@@ -436,8 +716,36 @@ fn prefill_one(
     }
 }
 
+fn restore_one(
+    model: &qwen_infer::QwenModel,
+    pool: &PagedKvPool,
+    seq: &mut Sequence,
+    shutdown: &AtomicBool,
+    stats: &Mutex<EngineStats>,
+) {
+    let pending = match seq.phase {
+        Phase::Restore { pending } => pending,
+        Phase::Prefill | Phase::Decode(_) => {
+            unreachable!("restore group only holds Phase::Restore")
+        }
+    };
+    let written = seq.tokens.len().saturating_sub(1);
+    debug_assert_eq!(seq.tokens.get(written).copied(), Some(pending));
+    let mut context = Vec::with_capacity(seq.prompt.len() + written);
+    context.extend_from_slice(&seq.prompt);
+    context.extend_from_slice(&seq.tokens[..written]);
+    let started = Instant::now();
+    let forwarded = model.forward_paged(&context, 0, &mut seq.cache, pool);
+    seq.prefill += started.elapsed();
+    match forwarded {
+        Ok(_) => seq.phase = Phase::Decode(pending),
+        Err(err) => fail_sequence(seq, &err, shutdown, stats),
+    }
+}
+
 fn decode_group(
     model: &qwen_infer::QwenModel,
+    pool: &PagedKvPool,
     codec: &dyn TokenCodec,
     decoding: &mut [Sequence],
     shutdown: &AtomicBool,
@@ -447,13 +755,16 @@ fn decode_group(
         .iter()
         .map(|seq| match seq.phase {
             Phase::Decode(id) => id,
-            Phase::Prefill => unreachable!("decode group only holds Phase::Decode"),
+            Phase::Prefill | Phase::Restore { .. } => {
+                unreachable!("decode group only holds Phase::Decode")
+            }
         })
         .collect();
     let started = Instant::now();
     let forwarded = {
-        let mut refs: Vec<&mut KvCache> = decoding.iter_mut().map(|seq| &mut seq.cache).collect();
-        model.forward_decode_batch(&ids, &mut refs)
+        let mut refs: Vec<&mut PagedCache> =
+            decoding.iter_mut().map(|seq| &mut seq.cache).collect();
+        model.forward_decode_batch_paged(&ids, &mut refs, pool)
     };
     let elapsed = started.elapsed();
     let share = elapsed / u32::try_from(decoding.len()).unwrap_or(1);
@@ -586,12 +897,20 @@ fn mark_closed(running: &mut [Sequence]) {
     }
 }
 
-fn evict_finished(running: &mut Vec<Sequence>, inflight: &AtomicUsize, stats: &Mutex<EngineStats>) {
+fn evict_finished(
+    running: &mut Vec<Sequence>,
+    alloc: &mut BlockAllocator,
+    pool: &PagedKvPool,
+    inflight: &AtomicUsize,
+    stats: &Mutex<EngineStats>,
+) {
     let mut retired = Vec::new();
     let mut index = 0;
     while index < running.len() {
         if running[index].outcome.is_some() {
-            retired.push(running.swap_remove(index));
+            let mut seq = running.swap_remove(index);
+            free_cache(&mut seq, alloc, pool);
+            retired.push(seq);
         } else {
             index += 1;
         }
@@ -602,7 +921,14 @@ fn evict_finished(running: &mut Vec<Sequence>, inflight: &AtomicUsize, stats: &M
     }
 }
 
-fn abandon(mut seq: Sequence, inflight: &AtomicUsize, stats: &Mutex<EngineStats>) {
+fn abandon(
+    mut seq: Sequence,
+    alloc: &mut BlockAllocator,
+    pool: &PagedKvPool,
+    inflight: &AtomicUsize,
+    stats: &Mutex<EngineStats>,
+) {
+    free_cache(&mut seq, alloc, pool);
     if seq.outcome.is_none() {
         seq.outcome = Some(Outcome::Finished {
             reason: StopReason::Cancelled,
@@ -749,6 +1075,12 @@ mod tests {
 
     struct UnitCodec;
 
+    fn tiny_pool(blocks: usize) -> (qwen_infer::QwenModel, qwen_infer::PagedKvPool) {
+        let model = qwen_infer::tiny_model(false);
+        let pool = model.kv_pool(blocks).expect("paged pool");
+        (model, pool)
+    }
+
     impl TokenCodec for UnitCodec {
         fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
             let _ = text;
@@ -882,14 +1214,16 @@ mod tests {
                 let stats = Arc::clone(&stats);
                 let inflight = Arc::clone(&inflight);
                 move || {
+                    let (model, pool) = tiny_pool(64);
                     engine_thread(
                         rx,
-                        qwen_infer::tiny_model(false),
+                        model,
                         Arc::new(UnitCodec),
                         shutdown,
                         stats,
                         inflight,
                         8,
+                        pool,
                     );
                 }
             })
@@ -919,6 +1253,10 @@ mod tests {
             "the eight requests were not in one batch: {stats:?}"
         );
         assert_eq!(stats.requests_finished, 8, "{stats:?}");
+        assert_eq!(
+            stats.preemptions, 0,
+            "64 blocks should not preempt: {stats:?}"
+        );
     }
 
     /// Blocks inside `decode_token` so the test can enqueue a second request
@@ -976,15 +1314,8 @@ mod tests {
                 let stats = Arc::clone(&stats);
                 let inflight = Arc::clone(&inflight);
                 move || {
-                    engine_thread(
-                        rx,
-                        qwen_infer::tiny_model(false),
-                        codec,
-                        shutdown,
-                        stats,
-                        inflight,
-                        4,
-                    );
+                    let (model, pool) = tiny_pool(64);
+                    engine_thread(rx, model, codec, shutdown, stats, inflight, 4, pool);
                 }
             })
             .expect("spawn");
@@ -1086,14 +1417,16 @@ mod tests {
                 let stats = Arc::clone(&stats);
                 let inflight = Arc::clone(&inflight);
                 move || {
+                    let (model, pool) = tiny_pool(64);
                     engine_thread(
                         rx,
-                        qwen_infer::tiny_model(false),
+                        model,
                         Arc::new(UnitCodec),
                         shutdown,
                         stats,
                         inflight,
                         4,
+                        pool,
                     );
                 }
             })
@@ -1193,14 +1526,16 @@ mod tests {
                 let stats = Arc::clone(&stats);
                 let inflight = Arc::clone(&inflight);
                 move || {
+                    let (model, pool) = tiny_pool(64);
                     engine_thread(
                         rx,
-                        qwen_infer::tiny_model(false),
+                        model,
                         Arc::new(PoisonCodec { poison }),
                         shutdown,
                         stats,
                         inflight,
                         4,
+                        pool,
                     );
                 }
             })
@@ -1272,6 +1607,208 @@ mod tests {
                 unit_bytes(id)
             }
         }
+    }
+
+    /// A sequence whose `Done` or `Failed` is still unsent is finished. It must
+    /// not be the preemption victim: restoring it would run the forward again.
+    #[test]
+    fn newest_preemptable_skips_pending_terminal_output() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut running = vec![
+            parked_sequence(1, tx.clone()),
+            parked_sequence(2, tx.clone()),
+        ];
+        assert_eq!(newest_preemptable(&running).map(|i| running[i].id), Some(2));
+
+        running[1]
+            .pending
+            .push_back(GenUpdate::Failed("kv pool".to_string()));
+        running[1].held_outcome = Some(Outcome::Failed);
+        assert_eq!(
+            newest_preemptable(&running).map(|i| running[i].id),
+            Some(1),
+            "a pending Failed must not be evicted"
+        );
+
+        running[1].pending.clear();
+        running[1].held_outcome = None;
+        running[1].pending.push_back(GenUpdate::Done(Done {
+            text: String::new(),
+            reason: StopReason::MaxTokens,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            tokens: vec![1],
+        }));
+        assert_eq!(
+            newest_preemptable(&running).map(|i| running[i].id),
+            Some(1),
+            "a pending Done must not be evicted"
+        );
+
+        running[1].pending.clear();
+        running[1]
+            .pending
+            .push_back(GenUpdate::Delta("a".to_string()));
+        assert_eq!(
+            newest_preemptable(&running).map(|i| running[i].id),
+            Some(2),
+            "a pending delta is not terminal; the newest sequence stays eligible"
+        );
+    }
+
+    fn parked_sequence(id: u64, tx: mpsc::Sender<GenUpdate>) -> Sequence {
+        Sequence {
+            id,
+            tokens: vec![1],
+            cache: qwen_infer::PagedCache::new(1),
+            admit_blocks: 1,
+            tx,
+            params: GenerateParams::greedy(1),
+            prompt: vec![1],
+            prompt_tokens: 1,
+            stream: true,
+            phase: Phase::Decode(1),
+            cursor: SampleCursor::new(GenerateParams::greedy(1)).expect("cursor"),
+            pending: VecDeque::new(),
+            blocked_since: None,
+            held_outcome: None,
+            outcome: None,
+            prefill: Duration::ZERO,
+            decode: Duration::ZERO,
+        }
+    }
+
+    /// Three blocks and two 16-token prompts. Each needs a second block for
+    /// its first generated token. The older sequence keeps the pool. The
+    /// newer one is evicted, recomputed, and both match a solo `generate`.
+    #[test]
+    fn preemption_recomputes_the_newest_sequence() {
+        let prompt_a = vec![1u32; qwen_infer::BLOCK_SIZE];
+        let prompt_b = vec![2u32; qwen_infer::BLOCK_SIZE];
+        let max_tokens = 4usize;
+        let (tx, rx) = sync_channel(8);
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(EngineStats::default()));
+        let ingress = Ingress::new(tx, Arc::clone(&inflight), 2, 2);
+        let (req_a, rx_a) = open_request(prompt_a.clone(), max_tokens, false);
+        let (req_b, rx_b) = open_request(prompt_b.clone(), max_tokens, false);
+        try_enqueue(&ingress, req_a).unwrap();
+        try_enqueue(&ingress, req_b).unwrap();
+        let handle = std::thread::Builder::new()
+            .name("qwen-engine".into())
+            .spawn({
+                let shutdown = Arc::clone(&shutdown);
+                let stats = Arc::clone(&stats);
+                let inflight = Arc::clone(&inflight);
+                move || {
+                    let (model, pool) = tiny_pool(3);
+                    engine_thread(
+                        rx,
+                        model,
+                        Arc::new(UnitCodec),
+                        shutdown,
+                        stats,
+                        inflight,
+                        2,
+                        pool,
+                    );
+                }
+            })
+            .expect("spawn");
+        let done_a = take_done(rx_a);
+        let done_b = take_done(rx_b);
+        let solo = qwen_infer::tiny_model(false);
+        let alone_a = qwen_infer::generate(
+            &solo,
+            &prompt_a,
+            &GenerateParams::greedy(max_tokens),
+            unit_bytes,
+        )
+        .unwrap();
+        let alone_b = qwen_infer::generate(
+            &solo,
+            &prompt_b,
+            &GenerateParams::greedy(max_tokens),
+            unit_bytes,
+        )
+        .unwrap();
+        assert_eq!(done_a.tokens, alone_a.tokens);
+        assert_eq!(done_b.tokens, alone_b.tokens);
+        assert_eq!(done_a.reason, alone_a.reason);
+        assert_eq!(done_b.reason, alone_b.reason);
+        shutdown.store(true, Ordering::SeqCst);
+        drop(ingress);
+        handle.join().expect("engine thread panicked");
+        let stats = stats.lock().expect("stats").clone();
+        assert!(
+            stats.preemptions >= 1,
+            "the tiny pool never preempted: {stats:?}"
+        );
+        assert_eq!(
+            stats.last_preempted_id, 2,
+            "the newest sequence should be the one evicted: {stats:?}"
+        );
+        assert_eq!(stats.requests_finished, 2, "{stats:?}");
+        assert!(!stats.active, "{stats:?}");
+        eprintln!(
+            "preemptions {} last_preempted_id {}",
+            stats.preemptions, stats.last_preempted_id
+        );
+    }
+
+    /// A prompt that needs two blocks cannot run in a one-block pool. The
+    /// engine reports that and still finishes a later request that fits.
+    #[test]
+    fn request_bigger_than_the_pool_fails_and_the_next_one_runs() {
+        let (tx, rx) = sync_channel(8);
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(EngineStats::default()));
+        let ingress = Ingress::new(tx, Arc::clone(&inflight), 2, 2);
+        let (big, mut big_rx) = open_request(vec![1u32; qwen_infer::BLOCK_SIZE + 1], 2, false);
+        let (small, small_rx) = open_request(vec![3, 4], 2, false);
+        try_enqueue(&ingress, big).unwrap();
+        try_enqueue(&ingress, small).unwrap();
+        let handle = std::thread::Builder::new()
+            .name("qwen-engine".into())
+            .spawn({
+                let shutdown = Arc::clone(&shutdown);
+                let stats = Arc::clone(&stats);
+                let inflight = Arc::clone(&inflight);
+                move || {
+                    let (model, pool) = tiny_pool(1);
+                    engine_thread(
+                        rx,
+                        model,
+                        Arc::new(UnitCodec),
+                        shutdown,
+                        stats,
+                        inflight,
+                        2,
+                        pool,
+                    );
+                }
+            })
+            .expect("spawn");
+        let failed = wait_update(&mut big_rx);
+        let GenUpdate::Failed(message) = failed else {
+            panic!("expected Failed from the oversized prompt");
+        };
+        assert!(message.contains("kv pool"), "{message}");
+        let (error_event, done) = crate::http::failure_frame(&message);
+        let parsed: serde_json::Value = serde_json::from_str(&error_event).unwrap();
+        assert_eq!(parsed["error"]["type"], "server_error");
+        assert_eq!(done, "[DONE]");
+        let small_done = take_done(small_rx);
+        let solo = qwen_infer::tiny_model(false);
+        let alone =
+            qwen_infer::generate(&solo, &[3, 4], &GenerateParams::greedy(2), unit_bytes).unwrap();
+        assert_eq!(small_done.tokens, alone.tokens);
+        shutdown.store(true, Ordering::SeqCst);
+        drop(ingress);
+        handle.join().expect("engine thread panicked");
+        assert_eq!(inflight.load(Ordering::SeqCst), 0);
     }
 
     fn wait_update(rx: &mut mpsc::Receiver<GenUpdate>) -> GenUpdate {

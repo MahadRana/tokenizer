@@ -33,6 +33,10 @@ use engine::{Ingress, engine_thread};
 pub struct ServerConfig {
     pub max_batch_size: usize,
     pub max_waiting: usize,
+    /// Physical KV blocks shared by every sequence. Each block holds
+    /// [`qwen_infer::BLOCK_SIZE`] tokens. The default is 256 blocks, which is
+    /// 4096 tokens of cache.
+    pub num_blocks: usize,
 }
 
 impl Default for ServerConfig {
@@ -40,6 +44,7 @@ impl Default for ServerConfig {
         Self {
             max_batch_size: 8,
             max_waiting: 32,
+            num_blocks: 256,
         }
     }
 }
@@ -166,7 +171,13 @@ pub async fn serve_with(
     if config.max_batch_size == 0 {
         anyhow::bail!("max_batch_size must be at least 1");
     }
+    if config.num_blocks == 0 {
+        anyhow::bail!("num_blocks must be at least 1");
+    }
     let max_position = model.max_position_embeddings();
+    let pool = model
+        .kv_pool(config.num_blocks)
+        .map_err(|err| anyhow::anyhow!("paged kv pool: {err}"))?;
     let max_inflight = config.max_batch_size.saturating_add(config.max_waiting);
     // The channel is at least as deep as the admission cap, so a reserved
     // slot can always be queued. `TrySendError::Full` is then the defensive
@@ -192,6 +203,7 @@ pub async fn serve_with(
                     stats,
                     inflight,
                     max_batch_size,
+                    pool,
                 )
             }
         })
