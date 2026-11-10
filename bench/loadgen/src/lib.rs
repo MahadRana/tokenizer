@@ -5,10 +5,13 @@
 //! do not wait for the previous request to finish, so a slow server shows
 //! up as queueing delay in TTFT instead of being hidden by a closed loop.
 //!
-//! TTFT is the time from sending the request to the first SSE `data:` line.
-//! Inter-token latency is the gap between consecutive output tokens, which
-//! are `data:` payloads that carry a non-empty `delta.content` (or a non-JSON
-//! payload that is not `[DONE]`, so a mock server can stay small).
+//! TTFT is the time from sending the request to the first SSE `data:` line
+//! that carries an output token. The chat server emits a role `data:` line
+//! as soon as the stream is polled, before prefill returns, so that line is
+//! not time-to-first-token. An output token is a `data:` payload with a
+//! non-empty `delta.content`, or a non-JSON payload that is not `[DONE]`
+//! (a mock server can stay small). Inter-token latency is the gap between
+//! those tokens.
 
 use std::time::{Duration, Instant};
 
@@ -114,11 +117,11 @@ impl SseCursor {
         let Some(payload) = data_payload(line) else {
             return;
         };
-        if self.first_data.is_none() {
-            self.first_data = Some(now);
-        }
         if payload == "[DONE]" || !is_output_token(payload) {
             return;
+        }
+        if self.first_data.is_none() {
+            self.first_data = Some(now);
         }
         if let Some(prev) = self.last_token {
             self.token_gaps.push(now.saturating_duration_since(prev));
@@ -414,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sse_ttft_is_the_first_data_event_from_a_mock_server() {
+    async fn sse_ttft_is_the_first_content_data_event_from_a_mock_server() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -464,10 +467,10 @@ mod tests {
             .unwrap();
         assert!(response.status().is_success());
         let observed = read_response(response, started).await;
-        let ttft = observed.first_data.expect("first data event");
+        let ttft = observed.first_data.expect("first content data event");
         assert!(
-            ttft >= Duration::from_millis(30),
-            "ttft {ttft:?} should include the server delay before the first data: line"
+            ttft >= Duration::from_millis(60),
+            "ttft {ttft:?} should wait for the content data: line, not the role line"
         );
         assert!(ttft < Duration::from_millis(500), "ttft {ttft:?}");
         assert_eq!(observed.output_tokens, 2);
