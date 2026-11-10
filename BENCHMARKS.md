@@ -229,3 +229,44 @@ Measured 2026-11-10, branch `feat/b5-paged-kv-cache`, rustc 1.99.1 (58cf8f9c3 20
 - Linux 6.12.113+ x86_64, KVM guest
 - 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores.
 - MemTotal 16,387,328 kB
+
+## B6: open-loop TTFT and throughput, one short sample
+
+Not a steady-state run and not a percentile study. Each cell is **one** sample: 1 warmup request (dropped) and **4** measured requests, seed 1, prompt `Hi`, `max_tokens` 4, temperature 0. p95 and p99 often land on the same histogram bucket because four points do not fill the tail. Output tokens/s is 16 tokens divided by the client wall clock, and that clock includes the Poisson gaps, so a low arrival rate is partly idle time.
+
+TTFT is the client clock from send to the first SSE `data:` line that has `delta.content`. The server writes a role `data:` line as soon as the stream is polled, before prefill returns. That line is not the first token.
+
+B2 has no HTTP server. "No batching" is this same `qwen-server` binary with `--max-batch-size 1`. The KV pool is still the B5 paged pool. It is not the original in-process `generate` loop. The contiguous B4 engine is not in this tree, so B4 is not in the table. The 2026-11-08 B4 row (one request 5.64 tok/s, eight concurrent 34.38 tok/s, 16 tokens, a different client) is a different experiment and is not copied here.
+
+Arrival rate equals the concurrency label, in requests/s. For the B5 rows, `--max-batch-size` is that same number. For no-batching it stays 1.
+
+```
+cargo build --release -p qwen-server -p loadgen
+target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size <batch> --max-waiting 32 --num-blocks 256
+target/release/loadgen --url http://127.0.0.1:18080/v1/chat/completions --requests 4 --rate <rate> --seed 1 --prompt Hi --max-tokens 4 --warmup 1
+```
+
+Model: Qwen/Qwen2.5-0.5B-Instruct, f32, `Device::Cpu`. Measured 2026-11-10, branch `feat/b6-benchmarks`, rustc 1.99.1 (58cf8f9c3 2026-10-13). Same machine as the B5 row.
+
+| mode | concurrency | max batch | output tok/s | req/s | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 | e2e p99 |
+|---|---|---|---|---|---|---|---|---|---|
+| no batching | 1 | 1 | 2.9526 | 0.7381 | 0.230 s | 0.737 s | 0.187 s | 0.233 s | 1.372 s |
+| no batching | 4 | 1 | 5.0228 | 1.2557 | 0.518 s | 1.575 s | 0.185 s | 0.199 s | 2.173 s |
+| no batching | 8 | 1 | 5.1548 | 1.2887 | 0.721 s | 2.033 s | 0.185 s | 0.190 s | 2.597 s |
+| no batching | 16 | 1 | 4.7613 | 1.1903 | 0.945 s | 2.542 s | 0.192 s | 0.223 s | 3.109 s |
+| B5 paged | 1 | 1 | 2.9529 | 0.7382 | 0.227 s | 0.791 s | 0.194 s | 0.225 s | 1.372 s |
+| B5 paged | 4 | 4 | 7.3966 | 1.8492 | 0.311 s | 0.651 s | 0.106 s | 1.014 s | 1.855 s |
+| B5 paged | 8 | 8 | 9.4901 | 2.3725 | 0.387 s | 0.783 s | 0.102 s | 0.744 s | 1.388 s |
+| B5 paged | 16 | 16 | 10.5754 | 2.6438 | 0.318 s | 0.858 s | 0.109 s | 0.761 s | 1.316 s |
+
+B5 throughput against p99 TTFT, the same four points. CSV: `bench/results/b6-ttft-curve.csv`.
+
+```
+output tok/s   p99 TTFT
+ 2.95          0.791 s  ########
+ 7.40          0.651 s  ######
+ 9.49          0.783 s  ########
+10.58          0.858 s  #########
+```
+
+Each `#` is about 0.1 s of p99 TTFT. Raising the batch cap from 1 to 16 moves output rate from 2.95 tok/s to 10.58 tok/s on this 4-request sample. p99 TTFT does not fall in a clean line: four arrivals are not a tail.
