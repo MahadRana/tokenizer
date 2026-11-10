@@ -281,7 +281,7 @@ Model: Qwen/Qwen2.5-0.5B-Instruct, f32, `Device::Cpu`. Measured 2026-11-10, rust
 - 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores, one socket.
 - MemTotal 16,387,328 kB
 
-A third offered load of 1 req/s was not run. The 0.06 cells take about 14 minutes each because the arrivals themselves span `(50-1)/0.06` seconds, and the six cells below used 3505 s. 100 requests would have doubled that span. 0.25 req/s is not the below-saturation point for batch size 1: one request takes about 6.3 s, so 0.25 req/s is more work than that proxy can finish.
+The 0.06 cells take about 14 minutes each because the arrivals themselves span `(50-1)/0.06` seconds. The first six cells used 3505 s. The four cells at 0.5 and 1.0 req/s are B4 and B5 only, same mix, seed, and batch cap, and finished in 375 s. 2.0 req/s was not run: 1.0 already saturates both of those modes. The batch-size-1 proxy has no row above 0.25 req/s, because that point is already saturated. 100 requests was not run.
 
 | mode | offered load | max batch | n | output tok/s | req/s | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 | e2e p99 |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -289,10 +289,16 @@ A third offered load of 1 req/s was not run. The 0.06 cells take about 14 minute
 | no batching | 0.25 req/s | 1 | 50 | 5.0282 | 0.1571 | 68.092 s | 110.952 s | 0.190 s | 0.222 s | 116.851 s |
 | B4 contiguous | 0.06 req/s | 8 | 50 | 1.8960 | 0.0593 | 0.393 s | 0.733 s | 0.192 s | 0.328 s | 7.193 s |
 | B4 contiguous | 0.25 req/s | 8 | 50 | 7.7556 | 0.2424 | 0.464 s | 1.083 s | 0.132 s | 0.664 s | 7.356 s |
+| B4 contiguous | 0.5 req/s | 8 | 50 | 15.1531 | 0.4735 | 0.579 s | 4.135 s | 0.144 s | 0.785 s | 12.149 s |
+| B4 contiguous | 1.0 req/s | 8 | 50 | 26.0757 | 0.8149 | 5.026 s | 9.781 s | 0.191 s | 0.903 s | 18.285 s |
 | B5 paged | 0.06 req/s | 8 | 50 | 1.8962 | 0.0593 | 0.392 s | 1.594 s | 0.189 s | 0.316 s | 7.713 s |
 | B5 paged | 0.25 req/s | 8 | 50 | 7.7725 | 0.2429 | 0.476 s | 1.223 s | 0.123 s | 0.730 s | 8.610 s |
+| B5 paged | 0.5 req/s | 8 | 50 | 15.1789 | 0.4743 | 0.504 s | 2.738 s | 0.132 s | 0.708 s | 9.978 s |
+| B5 paged | 1.0 req/s | 8 | 50 | 24.0145 | 0.7505 | 7.950 s | 12.255 s | 0.206 s | 1.148 s | 21.365 s |
 
-At 0.06 req/s every mode's achieved rate matches the offer, so that point is below saturation. No-batching's TTFT p50 (0.539 s) sits above the 0.35 s unloaded mix, and its p99 (14.8 s) is a Poisson burst waiting on the one in-flight request. B4 and B5 keep p99 TTFT under 2 s there, because batch 8 absorbs the burst. At 0.25 req/s no-batching achieves only 0.157 req/s: it is saturated, and TTFT p50 is 68 s. B4 and B5 still achieve about 0.24 req/s, with TTFT p50 under 0.5 s. The tok/s gap at 0.06 (1.88 vs 1.90) is the idle time, not the engine. CSV: `bench/results/b6-ttft-curve.csv`. Each `#` is about 1 s of p99 TTFT. The saturated no-batching cell is past that scale.
+Saturation here means the achieved request rate falls behind the offer, or TTFT p50 jumps. No batching does that at **0.25 req/s**: achieved 0.1571 against 0.25, and TTFT p50 goes from 0.539 s to 68.092 s. At 0.06 req/s it was still keeping up (0.0587 against 0.06). B4 and B5 do not do that at 0.5 req/s. Achieved rates are 0.4735 and 0.4743 against 0.5, TTFT p50 stays at 0.579 s and 0.504 s, and output rate is still climbing (7.76 to 15.15 tok/s for B4, 7.77 to 15.18 for B5). Both saturate at **1.0 req/s**. B4 achieves 0.8149 against 1.0 and TTFT p50 jumps to 5.026 s. B5 achieves 0.7505 against 1.0 and TTFT p50 jumps to 7.950 s. Nothing between 0.5 and 1.0 was measured, so the point named above is the first measured offer where that happened, not a fitted knee.
+
+The tok/s gap at 0.06 (1.88 vs 1.90) is the idle time, not the engine. CSV: `bench/results/b6-ttft-curve.csv`. Each `#` is about 1 s of p99 TTFT. The saturated no-batching cell and the 1.0 req/s p99s are past a 16 s scale, so those p99s are written as numbers.
 
 ```
 offered 0.06 req/s
@@ -304,4 +310,12 @@ offered 0.25 req/s
 no-batch  5.03 tok/s  p99 TTFT 111.0 s
 B4        7.76 tok/s  #                  1.1 s
 B5        7.77 tok/s  #                  1.2 s
+
+offered 0.5 req/s
+B4       15.15 tok/s  ####               4.1 s
+B5       15.18 tok/s  ###                2.7 s
+
+offered 1.0 req/s
+B4       26.08 tok/s  p99 TTFT 9.8 s   p50 TTFT 5.0 s
+B5       24.01 tok/s  p99 TTFT 12.3 s  p50 TTFT 8.0 s
 ```
