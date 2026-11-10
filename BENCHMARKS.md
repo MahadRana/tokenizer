@@ -232,41 +232,55 @@ Measured 2026-11-10, branch `feat/b5-paged-kv-cache`, rustc 1.99.1 (58cf8f9c3 20
 
 ## B6: open-loop TTFT and throughput, one short sample
 
-Not a steady-state run and not a percentile study. Each cell is **one** sample: 1 warmup request (dropped) and **4** measured requests, seed 1, prompt `Hi`, `max_tokens` 4, temperature 0. p95 and p99 often land on the same histogram bucket because four points do not fill the tail. Output tokens/s is 16 tokens divided by the client wall clock, and that clock includes the Poisson gaps, so a low arrival rate is partly idle time.
+Not a steady-state run. Each cell is **one** sample: 1 warmup request (dropped) and **16** measured requests, seed 1, prompt `Hi`, `max_tokens` 4, temperature 0. Every cell returned 16 ok, 0 errors, 64 output tokens. p95 and p99 land on the same histogram bucket in every cell: 16 points and 3 significant figures put the top of the sample in one bucket, so p99 here is the slowest request, rounded. Output tokens/s is 64 tokens divided by the client wall clock, and that clock includes the Poisson gaps, so a low arrival rate is partly idle time.
 
 TTFT is the client clock from send to the first SSE `data:` line that has `delta.content`. The server writes a role `data:` line as soon as the stream is polled, before prefill returns. That line is not the first token.
 
-B2 has no HTTP server. "No batching" is this same `qwen-server` binary with `--max-batch-size 1`. The KV pool is still the B5 paged pool. It is not the original in-process `generate` loop. The contiguous B4 engine is not in this tree, so B4 is not in the table. The 2026-11-08 B4 row (one request 5.64 tok/s, eight concurrent 34.38 tok/s, 16 tokens, a different client) is a different experiment and is not copied here.
+B2 has no HTTP server. "No batching" is the B5 `qwen-server` binary with `--max-batch-size 1`. The KV pool is still the B5 paged pool. It is not the original in-process `generate` loop. The B4 rows are a separate binary: the contiguous engine at main `3378a6b940ec1fef938962e5ec684df42ee5f3f8`, built in a detached worktree. That commit's CLI has no `--num-blocks`. The 2026-11-08 B4 row above (one request 5.64 tok/s, eight concurrent 34.38 tok/s, 16 tokens, a closed burst) is a different experiment and is not copied into this table.
 
-Arrival rate equals the concurrency label, in requests/s. For the B5 rows, `--max-batch-size` is that same number. For no-batching it stays 1.
+Arrival rate equals the concurrency label, in requests/s. For B4 and B5, `--max-batch-size` is that same number. For no-batching it stays 1. B5 and no-batching also pass `--num-blocks 256`.
+
+Paged server and loadgen, from `feat/b6-benchmarks` at `0af184d073c57cefbea7bfa579fcd1e877f63628` (the binaries measured here; this write-up does not change them):
 
 ```
 cargo build --release -p qwen-server -p loadgen
 target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size <batch> --max-waiting 32 --num-blocks 256
-target/release/loadgen --url http://127.0.0.1:18080/v1/chat/completions --requests 4 --rate <rate> --seed 1 --prompt Hi --max-tokens 4 --warmup 1
+target/release/loadgen --url http://127.0.0.1:18080/v1/chat/completions --requests 16 --rate <rate> --seed 1 --prompt Hi --max-tokens 4 --warmup 1
 ```
 
-Model: Qwen/Qwen2.5-0.5B-Instruct, f32, `Device::Cpu`. Measured 2026-11-10, branch `feat/b6-benchmarks`, rustc 1.99.1 (58cf8f9c3 2026-10-13). Same machine as the B5 row.
+Contiguous B4 server. The current branch was not moved. `CARGO_TARGET_DIR` keeps that build out of this tree's `target/`.
+
+```
+git worktree add --detach /tmp/b4-wt 3378a6b940ec1fef938962e5ec684df42ee5f3f8
+cd /tmp/b4-wt && CARGO_TARGET_DIR=/tmp/b4-target cargo build --release -p qwen-server
+/tmp/b4-target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size <batch> --max-waiting 32
+```
+
+The same loadgen binary, flags, seed, prompt, and `max_tokens` drove all three modes. Model: Qwen/Qwen2.5-0.5B-Instruct, f32, `Device::Cpu`. Measured 2026-11-10, rustc 1.99.1 (58cf8f9c3 2026-10-13). Same machine as the B5 row.
 
 | mode | concurrency | max batch | output tok/s | req/s | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 | e2e p99 |
 |---|---|---|---|---|---|---|---|---|---|
-| no batching | 1 | 1 | 2.9526 | 0.7381 | 0.230 s | 0.737 s | 0.187 s | 0.233 s | 1.372 s |
-| no batching | 4 | 1 | 5.0228 | 1.2557 | 0.518 s | 1.575 s | 0.185 s | 0.199 s | 2.173 s |
-| no batching | 8 | 1 | 5.1548 | 1.2887 | 0.721 s | 2.033 s | 0.185 s | 0.190 s | 2.597 s |
-| no batching | 16 | 1 | 4.7613 | 1.1903 | 0.945 s | 2.542 s | 0.192 s | 0.223 s | 3.109 s |
-| B5 paged | 1 | 1 | 2.9529 | 0.7382 | 0.227 s | 0.791 s | 0.194 s | 0.225 s | 1.372 s |
-| B5 paged | 4 | 4 | 7.3966 | 1.8492 | 0.311 s | 0.651 s | 0.106 s | 1.014 s | 1.855 s |
-| B5 paged | 8 | 8 | 9.4901 | 2.3725 | 0.387 s | 0.783 s | 0.102 s | 0.744 s | 1.388 s |
-| B5 paged | 16 | 16 | 10.5754 | 2.6438 | 0.318 s | 0.858 s | 0.109 s | 0.761 s | 1.316 s |
+| no batching | 1 | 1 | 4.1180 | 1.0295 | 1.222 s | 3.975 s | 0.191 s | 0.204 s | 4.551 s |
+| no batching | 4 | 1 | 4.8763 | 1.2191 | 4.149 s | 9.740 s | 0.193 s | 0.227 s | 10.330 s |
+| no batching | 8 | 1 | 5.0446 | 1.2612 | 4.862 s | 10.707 s | 0.190 s | 0.195 s | 11.289 s |
+| no batching | 16 | 1 | 4.9037 | 1.2259 | 5.362 s | 11.698 s | 0.194 s | 0.227 s | 12.354 s |
+| B4 contiguous | 1 | 1 | 4.0839 | 1.0210 | 1.276 s | 4.096 s | 0.193 s | 0.224 s | 4.678 s |
+| B4 contiguous | 4 | 4 | 9.8878 | 2.4720 | 1.217 s | 3.109 s | 0.306 s | 0.818 s | 3.680 s |
+| B4 contiguous | 8 | 8 | 12.3597 | 3.0899 | 1.312 s | 3.283 s | 0.323 s | 1.326 s | 3.779 s |
+| B4 contiguous | 16 | 16 | 14.3937 | 3.5984 | 1.419 s | 3.076 s | 0.192 s | 3.416 s | 4.194 s |
+| B5 paged | 1 | 1 | 4.1701 | 1.0425 | 1.082 s | 3.791 s | 0.185 s | 0.219 s | 4.367 s |
+| B5 paged | 4 | 4 | 10.2619 | 2.5655 | 1.099 s | 2.791 s | 0.289 s | 0.579 s | 3.453 s |
+| B5 paged | 8 | 8 | 13.6658 | 3.4164 | 1.169 s | 2.961 s | 0.317 s | 1.218 s | 3.451 s |
+| B5 paged | 16 | 16 | 15.3038 | 3.8259 | 1.324 s | 2.804 s | 0.204 s | 2.882 s | 3.846 s |
 
-B5 throughput against p99 TTFT, the same four points. CSV: `bench/results/b6-ttft-curve.csv`.
+Output tok/s and p99 TTFT, the same twelve points. CSV: `bench/results/b6-ttft-curve.csv`. Each `#` is about 1 s of p99 TTFT.
 
 ```
-output tok/s   p99 TTFT
- 2.95          0.791 s  ########
- 7.40          0.651 s  ######
- 9.49          0.783 s  ########
-10.58          0.858 s  #########
+concurrency   no-batch          B4 contiguous     B5 paged
+1             4.12 tok/s ####   4.08 tok/s ####   4.17 tok/s ####
+4             4.88 tok/s ##########  9.89 tok/s ###  10.26 tok/s ###
+8             5.04 tok/s ###########  12.36 tok/s ###  13.67 tok/s ###
+16            4.90 tok/s ############  14.39 tok/s ###  15.30 tok/s ###
 ```
 
-Each `#` is about 0.1 s of p99 TTFT. Raising the batch cap from 1 to 16 moves output rate from 2.95 tok/s to 10.58 tok/s on this 4-request sample. p99 TTFT does not fall in a clean line: four arrivals are not a tail.
+Batching is what moves the rate. At concurrency 16, no-batching stays near 4.9 tok/s with p99 TTFT 11.7 s, because the engine still runs one sequence at a time and the rest wait. B4 reaches 14.39 tok/s and B5 15.30 tok/s, with p99 TTFT near 3 s. On this short prompt the paged pool is a little faster than the contiguous `Tensor::cat` engine at every concurrency. The gap is small next to the batching gap, and 16 requests is still one sample.
