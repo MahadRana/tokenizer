@@ -492,6 +492,14 @@ fn reserve_blocks(
     shutdown: &AtomicBool,
     stats: &Mutex<EngineStats>,
 ) {
+    // A sequence waiting to deliver Done or Failed will not forward again.
+    // Drop its blocks here so they are not stuck behind that send, and so
+    // `newest_preemptable` does not have to evict it to free them.
+    for seq in running.iter_mut() {
+        if has_pending_terminal(seq) {
+            free_cache(seq, alloc, pool);
+        }
+    }
     loop {
         let Some(index) = grow_runnable(running, alloc) else {
             return;
@@ -530,11 +538,23 @@ fn grow_runnable(running: &mut [Sequence], alloc: &mut BlockAllocator) -> Option
     None
 }
 
+/// A `Done` or `Failed` still sitting in `pending` means generation is over.
+/// Evicting that sequence would drop the KV and later restore it, which can
+/// sample again or emit the terminal update twice. Those sequences are not
+/// victims. Their blocks are released separately, without a recompute.
+fn has_pending_terminal(seq: &Sequence) -> bool {
+    seq.held_outcome.is_some()
+        || seq
+            .pending
+            .iter()
+            .any(|update| matches!(update, GenUpdate::Done(_) | GenUpdate::Failed(_)))
+}
+
 fn newest_preemptable(running: &[Sequence]) -> Option<usize> {
     running
         .iter()
         .enumerate()
-        .filter(|(_, seq)| seq.outcome.is_none())
+        .filter(|(_, seq)| seq.outcome.is_none() && !has_pending_terminal(seq))
         .max_by_key(|(_, seq)| seq.id)
         .map(|(index, _)| index)
 }
@@ -1586,6 +1606,75 @@ mod tests {
             } else {
                 unit_bytes(id)
             }
+        }
+    }
+
+    /// A sequence whose `Done` or `Failed` is still unsent is finished. It must
+    /// not be the preemption victim: restoring it would run the forward again.
+    #[test]
+    fn newest_preemptable_skips_pending_terminal_output() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut running = vec![
+            parked_sequence(1, tx.clone()),
+            parked_sequence(2, tx.clone()),
+        ];
+        assert_eq!(newest_preemptable(&running).map(|i| running[i].id), Some(2));
+
+        running[1]
+            .pending
+            .push_back(GenUpdate::Failed("kv pool".to_string()));
+        running[1].held_outcome = Some(Outcome::Failed);
+        assert_eq!(
+            newest_preemptable(&running).map(|i| running[i].id),
+            Some(1),
+            "a pending Failed must not be evicted"
+        );
+
+        running[1].pending.clear();
+        running[1].held_outcome = None;
+        running[1].pending.push_back(GenUpdate::Done(Done {
+            text: String::new(),
+            reason: StopReason::MaxTokens,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            tokens: vec![1],
+        }));
+        assert_eq!(
+            newest_preemptable(&running).map(|i| running[i].id),
+            Some(1),
+            "a pending Done must not be evicted"
+        );
+
+        running[1].pending.clear();
+        running[1]
+            .pending
+            .push_back(GenUpdate::Delta("a".to_string()));
+        assert_eq!(
+            newest_preemptable(&running).map(|i| running[i].id),
+            Some(2),
+            "a pending delta is not terminal; the newest sequence stays eligible"
+        );
+    }
+
+    fn parked_sequence(id: u64, tx: mpsc::Sender<GenUpdate>) -> Sequence {
+        Sequence {
+            id,
+            tokens: vec![1],
+            cache: qwen_infer::PagedCache::new(1),
+            admit_blocks: 1,
+            tx,
+            params: GenerateParams::greedy(1),
+            prompt: vec![1],
+            prompt_tokens: 1,
+            stream: true,
+            phase: Phase::Decode(1),
+            cursor: SampleCursor::new(GenerateParams::greedy(1)).expect("cursor"),
+            pending: VecDeque::new(),
+            blocked_since: None,
+            held_outcome: None,
+            outcome: None,
+            prefill: Duration::ZERO,
+            decode: Duration::ZERO,
         }
     }
 

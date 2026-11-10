@@ -544,11 +544,15 @@ mod tests {
         assert_eq!(alloc.free_count(), alloc.capacity());
     }
 
-    /// One pool, sized like 8 sequences each reserved at 512 tokens.
-    /// Counting how many mixed lengths fit is arithmetic on block counts,
-    /// checked against the tensor's `elem_count`. It is not a timed run.
+    /// B4 stores each sequence with `Tensor::cat` at its exact length. Paging
+    /// rounds that length up to a block, so the same sequences take more
+    /// bytes, not fewer. The waste is under one block per sequence.
+    ///
+    /// A max-length reservation is not this baseline. B4 does not reserve one.
+    /// The ≥2× packing figure against that reservation is not a B4 result,
+    /// and this test does not assert it.
     #[test]
-    fn same_budget_fits_at_least_twice_the_sequences() {
+    fn paged_bytes_exceed_exact_cat_by_less_than_one_block_per_sequence() {
         // Qwen2.5-0.5B: 24 layers, 2 kv heads, head dim 64, f32.
         // One token of K and V is 24 * 2 * 2 * 64 * 4 = 24576 bytes.
         const LAYERS: usize = 24;
@@ -557,11 +561,32 @@ mod tests {
         let bytes_per_token = LAYERS * 2 * KV_HEADS * HEAD_DIM * std::mem::size_of::<f32>();
         assert_eq!(bytes_per_token, 24_576);
 
-        let max_len = 512usize;
-        let b4_reserved = 8usize;
-        let num_blocks = b4_reserved * max_len / BLOCK_SIZE;
+        let lengths = [
+            8usize, 16, 17, 24, 31, 32, 40, 48, 63, 64, 80, 96, 100, 127, 128, 160, 200, 255,
+        ];
+        // Repeat the list the same way the old count filled a 256-block pool,
+        // so the published 51-sequence numbers stay checkable. The comparison
+        // is still exact cat versus paged blocks for those sequences.
+        let mut used_blocks = 0usize;
+        let mut seq_lengths = Vec::new();
+        while seq_lengths.len() < 10_000 {
+            let len = lengths[seq_lengths.len() % lengths.len()];
+            let blocks = blocks_for_len(len);
+            if used_blocks + blocks > 256 {
+                break;
+            }
+            used_blocks += blocks;
+            seq_lengths.push(len);
+        }
+        let n = seq_lengths.len();
+        let exact_tokens: usize = seq_lengths.iter().sum();
+        let paged_tokens = used_blocks * BLOCK_SIZE;
+        let waste = paged_tokens - exact_tokens;
+        let exact_bytes = exact_tokens * bytes_per_token;
+        let paged_bytes = paged_tokens * bytes_per_token;
+
         let pool = PagedKvPool::new(
-            num_blocks,
+            used_blocks,
             LAYERS,
             KV_HEADS,
             HEAD_DIM,
@@ -569,57 +594,36 @@ mod tests {
             &Device::Cpu,
         )
         .unwrap();
-        assert_eq!(pool.num_blocks(), 256);
-        assert_eq!(pool.kv_bytes(), b4_reserved * max_len * bytes_per_token);
-
-        let reserved =
-            Tensor::zeros((1, KV_HEADS, max_len, HEAD_DIM), DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(pool.kv_bytes(), paged_bytes);
+        // One exact-length K tensor. Times 2 (K and V) times the layer count
+        // is what `Tensor::cat` holds for that sequence after the forward.
+        let sample_len = seq_lengths[0];
+        let exact_k = Tensor::zeros(
+            (1, KV_HEADS, sample_len, HEAD_DIM),
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
         assert_eq!(
-            reserved.elem_count() * std::mem::size_of::<f32>() * 2 * LAYERS,
-            max_len * bytes_per_token
+            exact_k.elem_count() * std::mem::size_of::<f32>() * 2 * LAYERS,
+            sample_len * bytes_per_token
         );
 
-        let lengths = [
-            8usize, 16, 17, 24, 31, 32, 40, 48, 63, 64, 80, 96, 100, 127, 128, 160, 200, 255,
-        ];
-        let longest = lengths.iter().copied().max().unwrap();
-        let mut used_blocks = 0usize;
-        let mut fitted = 0usize;
-        let mut exact_tokens = 0usize;
-        let mut paged_tokens = 0usize;
-        loop {
-            let len = lengths[fitted % lengths.len()];
-            let blocks = blocks_for_len(len);
-            if used_blocks + blocks > pool.num_blocks() {
-                break;
-            }
-            used_blocks += blocks;
-            exact_tokens += len;
-            paged_tokens += blocks * BLOCK_SIZE;
-            fitted += 1;
-        }
-        let b4_at_max_len = pool.kv_bytes() / (max_len * bytes_per_token);
-        let b4_at_longest = pool.kv_bytes() / (longest * bytes_per_token);
-        let ratio_max_len = fitted as f64 / b4_at_max_len as f64;
-        let ratio_longest = fitted as f64 / b4_at_longest as f64;
         eprintln!(
-            "paged budget {} bytes, {} blocks, fitted {fitted} mixed sequences",
-            pool.kv_bytes(),
-            pool.num_blocks()
-        );
-        eprintln!("b4 reserve {max_len}: {b4_at_max_len} sequences, paged/b4 {ratio_max_len:.4}");
-        eprintln!(
-            "b4 reserve longest {longest}: {b4_at_longest} sequences, paged/b4 {ratio_longest:.4}"
+            "exact cat {exact_bytes} bytes, paged {paged_bytes} bytes, {n} sequences, waste {waste} token slots"
         );
         eprintln!(
-            "same {fitted} sequences: exact cat {} bytes, paged {} bytes, waste {} token slots",
-            exact_tokens * bytes_per_token,
-            paged_tokens * bytes_per_token,
-            paged_tokens - exact_tokens
+            "paged/exact {:.4}; sequences are the same count, so this is not a 2x packing win",
+            paged_bytes as f64 / exact_bytes as f64
         );
-        assert!(fitted >= b4_at_max_len * 2, "fitted {fitted}");
-        assert!(fitted >= b4_at_longest * 2, "fitted {fitted} vs longest");
-        assert!(paged_tokens - exact_tokens < BLOCK_SIZE * fitted);
+        assert!(
+            paged_bytes > exact_bytes,
+            "paged {paged_bytes} is not above exact cat {exact_bytes}"
+        );
+        assert!(
+            waste < BLOCK_SIZE * n,
+            "waste {waste} is not under one block per sequence"
+        );
     }
 
     #[test]
