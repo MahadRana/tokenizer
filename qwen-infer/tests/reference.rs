@@ -317,6 +317,106 @@ fn batched_outputs_equal_solo_outputs() {
     }
 }
 
+/// Paged logits against the contiguous cache on the real weights.
+///
+/// One prefill per prompt and one batched decode step. No full recompute and
+/// no `generate` loop. A repeated prompt crosses a 16-token block.
+#[test]
+#[ignore = "downloads Qwen2.5-0.5B-Instruct and compares paged and contiguous logits"]
+fn paged_equals_contiguous() {
+    let (model, tok, _meta) = load_qwen();
+    let mut prompts = vec![
+        tok.encode("Hi").unwrap(),
+        tok.encode("The capital of France is").unwrap(),
+        tok.encode("Say hi").unwrap(),
+    ];
+    let mut long = prompts[1].clone();
+    while long.len() <= qwen_infer::BLOCK_SIZE {
+        long.extend_from_slice(&prompts[1]);
+    }
+    prompts.push(long);
+    let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    assert!(lens.iter().any(|len| *len < qwen_infer::BLOCK_SIZE));
+    assert!(lens.iter().any(|len| *len > qwen_infer::BLOCK_SIZE));
+    eprintln!("paged real-weight prompt lengths {lens:?}");
+
+    let blocks = 32usize;
+    let pool = model.kv_pool(blocks).unwrap();
+    let mut alloc = qwen_infer::BlockAllocator::new(u32::try_from(blocks).unwrap());
+    let mut paged = Vec::new();
+    let mut contig = Vec::new();
+    let mut rows = Vec::new();
+    let mut worst = 0.0f32;
+    for prompt in &prompts {
+        let mut cache = qwen_infer::PagedCache::new(model.num_layers());
+        cache.assign_blocks(
+            alloc
+                .alloc_n(qwen_infer::blocks_for_len(prompt.len()))
+                .unwrap(),
+        );
+        let mut plain = qwen_infer::KvCache::new(model.num_layers());
+        let paged_row = model
+            .forward_paged(prompt, 0, &mut cache, &pool)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let plain_row = model
+            .forward(prompt, 0, &mut plain)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let diff = max_abs_row(&paged_row, &plain_row);
+        worst = worst.max(diff);
+        assert!(diff <= 1e-4, "prefill len {} max abs {diff}", prompt.len());
+        rows.push(plain_row);
+        paged.push(cache);
+        contig.push(plain);
+    }
+    let next: Vec<u32> = rows
+        .iter()
+        .map(|row| qwen_infer::greedy_token(row).unwrap())
+        .collect();
+    for cache in &mut paged {
+        let need = qwen_infer::blocks_for_len(cache.seq_len() + 1);
+        if cache.block_count() < need {
+            cache.assign_blocks(alloc.alloc_n(need - cache.block_count()).unwrap());
+        }
+    }
+    let mut refs: Vec<&mut qwen_infer::PagedCache> = paged.iter_mut().collect();
+    let paged_rows = model
+        .forward_decode_batch_paged(&next, &mut refs, &pool)
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+    drop(refs);
+    let mut plain_refs: Vec<&mut qwen_infer::KvCache> = contig.iter_mut().collect();
+    let plain_rows = model
+        .forward_decode_batch(&next, &mut plain_refs)
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+    for (index, len) in lens.iter().enumerate() {
+        let diff = max_abs_row(&paged_rows[index], &plain_rows[index]);
+        worst = worst.max(diff);
+        assert!(diff <= 1e-4, "decode seq {index} len {len} max abs {diff}");
+    }
+    eprintln!("real-weight paged vs contiguous max abs {worst}");
+    for cache in &mut paged {
+        for id in cache.take_blocks() {
+            alloc.free_block(id).unwrap();
+        }
+    }
+    assert_eq!(alloc.free_count(), alloc.capacity());
+}
+
+fn max_abs_row(left: &[f32], right: &[f32]) -> f32 {
+    assert_eq!(left.len(), right.len());
+    left.iter()
+        .zip(right)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
+}
+
 fn load_qwen() -> (qwen_infer::QwenModel, tokenizer::RankTokenizer, Meta) {
     let files = qwen_infer::download_qwen().expect("hf-hub download");
     let tokenizer_path = files.tokenizer.to_str().expect("tokenizer path is utf-8");

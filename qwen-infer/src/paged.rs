@@ -544,6 +544,84 @@ mod tests {
         assert_eq!(alloc.free_count(), alloc.capacity());
     }
 
+    /// One pool, sized like 8 sequences each reserved at 512 tokens.
+    /// Counting how many mixed lengths fit is arithmetic on block counts,
+    /// checked against the tensor's `elem_count`. It is not a timed run.
+    #[test]
+    fn same_budget_fits_at_least_twice_the_sequences() {
+        // Qwen2.5-0.5B: 24 layers, 2 kv heads, head dim 64, f32.
+        // One token of K and V is 24 * 2 * 2 * 64 * 4 = 24576 bytes.
+        const LAYERS: usize = 24;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 64;
+        let bytes_per_token = LAYERS * 2 * KV_HEADS * HEAD_DIM * std::mem::size_of::<f32>();
+        assert_eq!(bytes_per_token, 24_576);
+
+        let max_len = 512usize;
+        let b4_reserved = 8usize;
+        let num_blocks = b4_reserved * max_len / BLOCK_SIZE;
+        let pool = PagedKvPool::new(
+            num_blocks,
+            LAYERS,
+            KV_HEADS,
+            HEAD_DIM,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(pool.num_blocks(), 256);
+        assert_eq!(pool.kv_bytes(), b4_reserved * max_len * bytes_per_token);
+
+        let reserved =
+            Tensor::zeros((1, KV_HEADS, max_len, HEAD_DIM), DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(
+            reserved.elem_count() * std::mem::size_of::<f32>() * 2 * LAYERS,
+            max_len * bytes_per_token
+        );
+
+        let lengths = [
+            8usize, 16, 17, 24, 31, 32, 40, 48, 63, 64, 80, 96, 100, 127, 128, 160, 200, 255,
+        ];
+        let longest = lengths.iter().copied().max().unwrap();
+        let mut used_blocks = 0usize;
+        let mut fitted = 0usize;
+        let mut exact_tokens = 0usize;
+        let mut paged_tokens = 0usize;
+        loop {
+            let len = lengths[fitted % lengths.len()];
+            let blocks = blocks_for_len(len);
+            if used_blocks + blocks > pool.num_blocks() {
+                break;
+            }
+            used_blocks += blocks;
+            exact_tokens += len;
+            paged_tokens += blocks * BLOCK_SIZE;
+            fitted += 1;
+        }
+        let b4_at_max_len = pool.kv_bytes() / (max_len * bytes_per_token);
+        let b4_at_longest = pool.kv_bytes() / (longest * bytes_per_token);
+        let ratio_max_len = fitted as f64 / b4_at_max_len as f64;
+        let ratio_longest = fitted as f64 / b4_at_longest as f64;
+        eprintln!(
+            "paged budget {} bytes, {} blocks, fitted {fitted} mixed sequences",
+            pool.kv_bytes(),
+            pool.num_blocks()
+        );
+        eprintln!("b4 reserve {max_len}: {b4_at_max_len} sequences, paged/b4 {ratio_max_len:.4}");
+        eprintln!(
+            "b4 reserve longest {longest}: {b4_at_longest} sequences, paged/b4 {ratio_longest:.4}"
+        );
+        eprintln!(
+            "same {fitted} sequences: exact cat {} bytes, paged {} bytes, waste {} token slots",
+            exact_tokens * bytes_per_token,
+            paged_tokens * bytes_per_token,
+            paged_tokens - exact_tokens
+        );
+        assert!(fitted >= b4_at_max_len * 2, "fitted {fitted}");
+        assert!(fitted >= b4_at_longest * 2, "fitted {fitted} vs longest");
+        assert!(paged_tokens - exact_tokens < BLOCK_SIZE * fitted);
+    }
+
     #[test]
     fn gather_reads_back_what_write_stored() {
         let kv_heads = 2usize;

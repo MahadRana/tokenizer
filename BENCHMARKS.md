@@ -204,3 +204,28 @@ Measured 2026-11-08, branch `feat/b4-continuous-batching`, rustc 1.99.1 (58cf8f9
 A separate call, not folded into the ratio: one 12-token stream was already producing content, then a 1-token request was sent. Client TTFT for that short request was **0.5532 s**, text `Hello`. The long request was still running (`max_running` 2) and was cancelled at 4 completion tokens when the test dropped it. One sample, not a latency distribution.
 
 A second sample after the slow-client send path landed is not a replacement. Same commands, same machine: single **2.9118 s** (**5.4949 tok/s**), batch **3.7862 s** (**33.8067 tok/s**, **6.15×**), short TTFT **0.5710 s**. The table above stays the first sample.
+
+## B5: how many mixed-length sequences fit in one KV budget
+
+Not a timed run, not a load test, and not a percentile. `same_budget_fits_at_least_twice_the_sequences` builds one paged pool and counts sequences. Nothing is warmed up because nothing is clocked. One deterministic pass. The length list is fixed and then repeated until the next sequence does not fit:
+
+`8, 16, 17, 24, 31, 32, 40, 48, 63, 64, 80, 96, 100, 127, 128, 160, 200, 255`
+
+Qwen2.5-0.5B shapes, the ones documented on the forward: 24 layers, 2 kv heads, head dim 64, f32. One token of K and V is `24 * 2 * 2 * 64 * 4` = **24,576** bytes. The test checks that formula against `Tensor::elem_count` on a real `(1, 2, 512, 64)` reservation and against `PagedKvPool::kv_bytes` for the pool. Pool: 256 blocks of 16 tokens, **100,663,296** bytes (96 MiB).
+
+Two ways to spend that budget on a contiguous cache that reserves a length up front, which is the alternative to paging (the B4 cache itself grows with `Tensor::cat` and stores the exact length; that comparison is the next paragraph, and it is not 2×):
+
+| reservation per sequence | sequences in 100,663,296 bytes | paged mixed lengths in the same bytes | ratio |
+|---|---|---|---|
+| 512 tokens (a fixed cap) | **8** | **51** | **6.375×** |
+| 255 tokens (the longest length in the mix) | **16** | **51** | **3.1875×** |
+
+51 / 8 = 6.375. 51 / 16 = 3.1875. Both clear 2×. The 51 is how many times the list can be walked before `used_blocks + blocks_for_len(next) > 256`.
+
+Same 51 sequences, stored exactly the way `Tensor::cat` does, with no reserved tail: **94,666,752** bytes. The paged blocks for those sequences are **99,090,432** bytes. Paging is larger by **4,423,680** bytes, which is **180** token slots, **180 / 51 = 3.53** slots each, under one block of 16. That is internal fragmentation. It is not compression, and it is not a claim that a live server RSS dropped.
+
+Measured 2026-11-10, branch `feat/b5-paged-kv-cache`, rustc 1.99.1 (58cf8f9c3 2026-10-13), candle-core 0.11.1, `DType::F32`, `Device::Cpu`. Same machine class as the B4 row.
+
+- Linux 6.12.113+ x86_64, KVM guest
+- 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores.
+- MemTotal 16,387,328 kB
