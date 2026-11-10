@@ -2,11 +2,12 @@
 # The root package is the core library and the binary. `tokenizer-py` is the
 # Python cdylib. `qwen-infer` is the Qwen forward pass (candle, hf-hub).
 # `qwen-server` is the OpenAI HTTP API; it depends on `qwen-infer`, so it
-# pulls candle in too. Neither is a default member, so `cargo test` from this
-# directory still runs the core suite and does not compile candle.
-# `cargo clippy --workspace` typechecks all four. The fuzz crate stays its
+# pulls candle in too. `bench/loadgen` is the B6 open-loop client. None of
+# those are default members, so `cargo test` from this directory still runs
+# the core suite and does not compile candle.
+# `cargo clippy --workspace` typechecks all five. The fuzz crate stays its
 # own workspace under `fuzz/`.
-members = [".", "tokenizer-py", "qwen-infer", "qwen-server"]
+members = [".", "tokenizer-py", "qwen-infer", "qwen-server", "bench/loadgen"]
 default-members = ["."]
 
 [package]

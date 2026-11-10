@@ -1,0 +1,32 @@
+[package]
+name = "loadgen"
+version = "0.1.0"
+edition = "2024"
+description = "Open-loop Poisson load generator for the Qwen chat server"
+publish = false
+
+[dependencies]
+# hdrhistogram 7.6.0 (crates.io). Percentiles are
+# `Histogram::value_at_quantile`. Default features pull flate2/nom for
+# serialization, which this bench does not use.
+# https://docs.rs/hdrhistogram/7.6.0/hdrhistogram/struct.Histogram.html
+hdrhistogram = { version = "=7.6.0", default-features = false }
+# rand 0.10.3 is already the workspace sampler pin. `StdRng::seed_from_u64`
+# makes a run reproducible. https://docs.rs/rand/0.10.3/rand/rngs/struct.StdRng.html
+rand = "=0.10.3"
+# rand_distr 0.6.0 depends on rand 0.10. Poisson arrivals use `Exp::new(rate)`,
+# whose mean is `1/rate`. https://docs.rs/rand_distr/0.6.0/rand_distr/struct.Exp.html
+rand_distr = "=0.6.0"
+# reqwest 0.13.5 is the client already used by qwen-server's tests. `stream`
+# turns on `Response::bytes_stream` so TTFT is the first SSE `data:` line,
+# not the completed body. https://docs.rs/reqwest/0.13.5/reqwest/struct.Response.html
+reqwest = { version = "=0.13.5", features = ["json", "stream"] }
+# serde_json 1.0.154 is the pin already in Cargo.lock. The request body and
+# the SSE payload's `delta.content` both go through it.
+serde_json = "=1.0.154"
+# tokio 1.54.1 is the server's runtime pin. One task per request, as the
+# roadmap notes (`'static + Send`). https://docs.rs/tokio/1.54.1/tokio/task/fn.spawn.html
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+# `StreamExt::next` for the reqwest byte stream. 0.3.34 is the version Cargo.lock
+# already resolved for the server. https://docs.rs/futures-util/0.3.34/futures_util/stream/trait.StreamExt.html
+futures-util = "=0.3.34"
