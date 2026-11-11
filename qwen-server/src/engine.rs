@@ -81,6 +81,8 @@ pub struct EngineStats {
     pub last_preempted_id: u64,
     /// Most blocks that had a positive refcount at once.
     pub peak_blocks: u64,
+    /// Most blocks off the free stack at once, including refcount-0 cache hits.
+    pub peak_occupied: u64,
 }
 
 pub struct GenRequest {
@@ -362,10 +364,7 @@ pub fn engine_thread(
                 &stats,
             );
         }
-        {
-            let mut guard = stats.lock().expect("engine stats");
-            guard.peak_blocks = guard.peak_blocks.max(alloc.peak_live() as u64);
-        }
+        note_peaks(&stats, &alloc);
         evict_finished(&mut running, &mut alloc, &pool, &inflight, &stats);
         // Oldest preempted sequence is admitted first, ahead of requests that
         // have not run. This happens after admission for this iteration, so a
@@ -388,7 +387,7 @@ pub fn engine_thread(
     for seq in leftover {
         abandon(seq, &mut alloc, &pool, &inflight, &stats);
     }
-    eprintln!("prefix peak_live {}", alloc.peak_live());
+    note_peaks(&stats, &alloc);
     assert!(
         alloc.all_refcounts_zero(),
         "kv refcounts still held after the engine stopped"
@@ -486,27 +485,71 @@ fn admit(
             }
             continue;
         }
-        let prompt = waiting.front().expect("front").prompt.clone();
+        let source = prefix_source(waiting.front().expect("front"));
+        let mark = alloc.peak_mark();
         let shared = if prefix_cache {
-            alloc.take_shared_prefix(&prompt)
+            // Leave at least one token out of the lookup. That token, and the
+            // block it lands in, is private, so a later forward never writes
+            // a block another sequence holds.
+            alloc.take_shared_prefix(shareable(&source))
         } else {
             Vec::new()
         };
         let fresh = needed - shared.len();
         if alloc.available() < fresh {
             release_ids(&shared, alloc, pool);
+            alloc.rewind_peaks(mark);
             break;
         }
         let mut seq = waiting.pop_front().expect("front");
         let mut ids = shared;
         if fresh > 0 {
-            ids.extend(alloc.alloc_n(fresh).expect("available was checked"));
+            let extra = alloc.alloc_n(fresh).expect("available was checked");
+            clear_ids(&extra, pool);
+            ids.extend(extra);
         }
         debug_assert_eq!(seq.cache.block_count(), 0);
         let shared_tokens = (ids.len() - fresh) * BLOCK_SIZE;
         seq.cache.assign_blocks(ids);
         seq.cache.set_seq_len(shared_tokens);
         running.push(seq);
+    }
+}
+
+/// Tokens whose full blocks may be shared. The last token is excluded so the
+/// block that contains it stays private.
+fn shareable(tokens: &[u32]) -> &[u32] {
+    if tokens.is_empty() {
+        tokens
+    } else {
+        &tokens[..tokens.len() - 1]
+    }
+}
+
+fn prefix_source(seq: &Sequence) -> Vec<u32> {
+    match seq.phase {
+        Phase::Restore { .. } => {
+            let written = seq.tokens.len().saturating_sub(1);
+            let mut context = Vec::with_capacity(seq.prompt.len() + written);
+            context.extend_from_slice(&seq.prompt);
+            context.extend_from_slice(&seq.tokens[..written]);
+            context
+        }
+        Phase::Prefill | Phase::Decode(_) => seq.prompt.clone(),
+    }
+}
+
+fn note_peaks(stats: &Mutex<EngineStats>, alloc: &BlockAllocator) {
+    let mut guard = stats.lock().expect("engine stats");
+    guard.peak_blocks = guard.peak_blocks.max(alloc.peak_live() as u64);
+    guard.peak_occupied = guard.peak_occupied.max(alloc.peak_occupied() as u64);
+}
+
+fn clear_ids(ids: &[qwen_infer::BlockId], pool: &PagedKvPool) {
+    for id in ids {
+        if let Err(err) = pool.clear_block(*id) {
+            eprintln!("clear {id}: {err}");
+        }
     }
 }
 
@@ -532,7 +575,7 @@ fn reserve_blocks(
         }
     }
     loop {
-        let Some(index) = grow_runnable(running, alloc) else {
+        let Some(index) = grow_runnable(running, alloc, pool) else {
             return;
         };
         let need = blocks_for_step(&running[index]);
@@ -548,7 +591,11 @@ fn reserve_blocks(
     }
 }
 
-fn grow_runnable(running: &mut [Sequence], alloc: &mut BlockAllocator) -> Option<usize> {
+fn grow_runnable(
+    running: &mut [Sequence],
+    alloc: &mut BlockAllocator,
+    pool: &PagedKvPool,
+) -> Option<usize> {
     let mut order: Vec<usize> = (0..running.len())
         .filter(|&index| can_forward(&running[index]))
         .collect();
@@ -564,6 +611,7 @@ fn grow_runnable(running: &mut [Sequence], alloc: &mut BlockAllocator) -> Option
             return Some(index);
         }
         let ids = alloc.alloc_n(extra).expect("available was checked");
+        clear_ids(&ids, pool);
         running[index].cache.assign_blocks(ids);
     }
     None
@@ -657,16 +705,28 @@ fn resume_blocks(seq: &Sequence) -> usize {
 
 fn debug_assert_cache(seq: &Sequence) {
     match seq.phase {
-        Phase::Prefill => debug_assert_eq!(seq.cache.seq_len(), 0),
+        Phase::Prefill | Phase::Restore { .. } => {
+            let len = seq.cache.seq_len();
+            debug_assert!(
+                len == 0 || len.is_multiple_of(BLOCK_SIZE),
+                "id {} shared prefix {len} is not a whole number of blocks",
+                seq.id
+            );
+            debug_assert!(
+                blocks_for_len(len) <= seq.cache.block_count(),
+                "id {} shared prefix {len} does not fit in {} blocks",
+                seq.id,
+                seq.cache.block_count()
+            );
+        }
         Phase::Decode(pending) => {
             let expected = seq.prompt.len() + seq.tokens.len().saturating_sub(1);
             debug_assert_eq!(seq.cache.seq_len(), expected, "id {}", seq.id);
             debug_assert_eq!(seq.tokens.last().copied(), Some(pending));
         }
-        Phase::Restore { pending } => {
-            debug_assert_eq!(seq.cache.seq_len(), 0);
-            debug_assert_eq!(seq.tokens.last().copied(), Some(pending));
-        }
+    }
+    if let Phase::Restore { pending } = seq.phase {
+        debug_assert_eq!(seq.tokens.last().copied(), Some(pending));
     }
 }
 
@@ -774,20 +834,20 @@ fn prefill_one(
     }
 }
 
-/// Prefill `ids[cache.seq_len()..]`. A prefix hit leaves `seq_len` on a block
-/// boundary. When that is the whole prompt, the last token is run again so
-/// there is a logit row. That write is the same token into a block that
-/// already holds it.
+/// Prefill `ids[cache.seq_len()..]`. Admit leaves `seq_len` strictly below
+/// `ids.len()`, on a block boundary, so this writes only the private suffix.
 fn forward_remaining(
     model: &qwen_infer::QwenModel,
     ids: &[u32],
     cache: &mut PagedCache,
     pool: &PagedKvPool,
 ) -> std::result::Result<Vec<f32>, String> {
-    let mut pos = cache.seq_len();
-    if pos == ids.len() && pos > 0 {
-        pos -= 1;
-        cache.set_seq_len(pos);
+    let pos = cache.seq_len();
+    if pos >= ids.len() {
+        return Err(format!(
+            "prefix left no suffix token to prefill (pos {pos}, len {})",
+            ids.len()
+        ));
     }
     let logits = model
         .forward_paged(&ids[pos..], pos, cache, pool)
@@ -2143,6 +2203,291 @@ mod tests {
             free_cache(&mut seq, &mut alloc, &pool);
         }
         assert!(alloc.all_refcounts_zero());
+    }
+
+    #[test]
+    fn shared_block_kv_is_unchanged_when_the_second_sharer_decodes() {
+        let prompt = vec![1u32; qwen_infer::BLOCK_SIZE * 2];
+        let (model, pool) = tiny_pool(8);
+        let mut alloc = BlockAllocator::new(8);
+        let shutdown = AtomicBool::new(false);
+        let stats = Mutex::new(EngineStats::default());
+        let inflight = AtomicUsize::new(0);
+        let (req_a, mut rx_a) = open_request(prompt.clone(), 2, false);
+        let (req_b, mut rx_b) = open_request(prompt.clone(), 2, false);
+        let mut next_id = 1u64;
+        let mut waiting = VecDeque::new();
+        let mut running = Vec::new();
+        waiting.push_back(
+            accept(
+                req_a,
+                &mut next_id,
+                model.num_layers(),
+                &inflight,
+                &shutdown,
+                &stats,
+            )
+            .expect("a"),
+        );
+        admit(
+            &mut waiting,
+            &mut running,
+            &mut alloc,
+            &pool,
+            2,
+            true,
+            &shutdown,
+            &stats,
+            &inflight,
+        );
+        step_batch(
+            &model,
+            &pool,
+            &UnitCodec,
+            &mut running,
+            &mut alloc,
+            true,
+            &shutdown,
+            &stats,
+        );
+        let shared_id = running[0].cache.block_table()[0];
+        let before = snapshot_block(&pool, shared_id);
+        waiting.push_back(
+            accept(
+                req_b,
+                &mut next_id,
+                model.num_layers(),
+                &inflight,
+                &shutdown,
+                &stats,
+            )
+            .expect("b"),
+        );
+        admit(
+            &mut waiting,
+            &mut running,
+            &mut alloc,
+            &pool,
+            2,
+            true,
+            &shutdown,
+            &stats,
+            &inflight,
+        );
+        let second = running.iter().find(|seq| seq.id == 2).expect("sharer");
+        assert_eq!(second.cache.seq_len(), qwen_infer::BLOCK_SIZE);
+        assert_eq!(second.cache.block_table()[0], shared_id);
+        let mut done_a = None;
+        let mut done_b = None;
+        let mut guard = 0;
+        while done_a.is_none() || done_b.is_none() {
+            guard += 1;
+            assert!(guard < 40, "sharers did not finish");
+            let mut deferred = VecDeque::new();
+            reserve_blocks(
+                &mut running,
+                &mut deferred,
+                &mut alloc,
+                &pool,
+                &shutdown,
+                &stats,
+            );
+            if running.iter().any(can_forward) {
+                step_batch(
+                    &model,
+                    &pool,
+                    &UnitCodec,
+                    &mut running,
+                    &mut alloc,
+                    true,
+                    &shutdown,
+                    &stats,
+                );
+            }
+            evict_finished(&mut running, &mut alloc, &pool, &inflight, &stats);
+            for seq in deferred.drain(..) {
+                waiting.push_front(seq);
+            }
+            collect_done(&mut rx_a, &mut done_a);
+            collect_done(&mut rx_b, &mut done_b);
+        }
+        assert_eq!(snapshot_block(&pool, shared_id), before);
+        for mut seq in waiting.drain(..).chain(running.drain(..)) {
+            free_cache(&mut seq, &mut alloc, &pool);
+        }
+        assert!(alloc.all_refcounts_zero());
+        assert_eq!(alloc.free_count() + alloc.cached_count(), alloc.capacity());
+    }
+
+    #[test]
+    fn freshly_admitted_sharer_is_the_preemption_victim() {
+        let prompt = vec![1u32; qwen_infer::BLOCK_SIZE * 2];
+        let (model, pool) = tiny_pool(3);
+        let mut alloc = BlockAllocator::new(3);
+        let shutdown = AtomicBool::new(false);
+        let stats = Mutex::new(EngineStats::default());
+        let inflight = AtomicUsize::new(0);
+        let (req_a, _rx_a) = open_request(prompt.clone(), 4, false);
+        let (req_b, _rx_b) = open_request(prompt, 4, false);
+        let mut next_id = 1u64;
+        let mut waiting = VecDeque::new();
+        let mut running = Vec::new();
+        waiting.push_back(
+            accept(
+                req_a,
+                &mut next_id,
+                model.num_layers(),
+                &inflight,
+                &shutdown,
+                &stats,
+            )
+            .expect("a"),
+        );
+        admit(
+            &mut waiting,
+            &mut running,
+            &mut alloc,
+            &pool,
+            2,
+            true,
+            &shutdown,
+            &stats,
+            &inflight,
+        );
+        step_batch(
+            &model,
+            &pool,
+            &UnitCodec,
+            &mut running,
+            &mut alloc,
+            true,
+            &shutdown,
+            &stats,
+        );
+        waiting.push_back(
+            accept(
+                req_b,
+                &mut next_id,
+                model.num_layers(),
+                &inflight,
+                &shutdown,
+                &stats,
+            )
+            .expect("b"),
+        );
+        admit(
+            &mut waiting,
+            &mut running,
+            &mut alloc,
+            &pool,
+            2,
+            true,
+            &shutdown,
+            &stats,
+            &inflight,
+        );
+        assert_eq!(running.len(), 2);
+        assert_eq!(
+            running
+                .iter()
+                .find(|seq| seq.id == 2)
+                .unwrap()
+                .cache
+                .seq_len(),
+            qwen_infer::BLOCK_SIZE
+        );
+        let mut deferred = VecDeque::new();
+        reserve_blocks(
+            &mut running,
+            &mut deferred,
+            &mut alloc,
+            &pool,
+            &shutdown,
+            &stats,
+        );
+        assert_eq!(stats.lock().expect("stats").last_preempted_id, 2);
+        assert!(deferred.iter().any(|seq| seq.id == 2));
+        assert!(running.iter().any(|seq| seq.id == 1));
+        for mut seq in waiting
+            .drain(..)
+            .chain(running.drain(..))
+            .chain(deferred.drain(..))
+        {
+            free_cache(&mut seq, &mut alloc, &pool);
+        }
+    }
+
+    #[test]
+    fn mixed_run_releases_every_refcount() {
+        let shared_prompt = vec![1u32; qwen_infer::BLOCK_SIZE * 2];
+        let other = vec![2u32; qwen_infer::BLOCK_SIZE + 4];
+        let (model, pool) = tiny_pool(8);
+        let mut alloc = BlockAllocator::new(8);
+        let shutdown = AtomicBool::new(false);
+        let stats = Mutex::new(EngineStats::default());
+        let inflight = AtomicUsize::new(0);
+        let mut next_id = 1u64;
+        let mut waiting = VecDeque::new();
+        let mut running = Vec::new();
+        let mut receivers = Vec::new();
+        for prompt in [shared_prompt.clone(), shared_prompt, other] {
+            let (req, rx) = open_request(prompt, 1, false);
+            receivers.push(rx);
+            waiting.push_back(
+                accept(
+                    req,
+                    &mut next_id,
+                    model.num_layers(),
+                    &inflight,
+                    &shutdown,
+                    &stats,
+                )
+                .expect("request"),
+            );
+            admit(
+                &mut waiting,
+                &mut running,
+                &mut alloc,
+                &pool,
+                3,
+                true,
+                &shutdown,
+                &stats,
+                &inflight,
+            );
+            step_batch(
+                &model,
+                &pool,
+                &UnitCodec,
+                &mut running,
+                &mut alloc,
+                true,
+                &shutdown,
+                &stats,
+            );
+        }
+        for mut seq in waiting.drain(..).chain(running.drain(..)) {
+            free_cache(&mut seq, &mut alloc, &pool);
+        }
+        assert_eq!(receivers.len(), 3);
+        assert!(alloc.all_refcounts_zero());
+        assert_eq!(alloc.free_count() + alloc.cached_count(), alloc.capacity());
+        assert!(
+            alloc.cached_count() > 0,
+            "the shared prefix should still be cached"
+        );
+    }
+
+    fn snapshot_block(pool: &PagedKvPool, id: qwen_infer::BlockId) -> Vec<f32> {
+        let mut out = Vec::new();
+        for layer in 0..pool.num_layers() {
+            for keys in [true, false] {
+                let tensor = pool.gather_layer(layer, &[id], keys).unwrap();
+                let n = tensor.elem_count();
+                out.extend(tensor.reshape((n,)).unwrap().to_vec1::<f32>().unwrap());
+            }
+        }
+        out
     }
 
     fn collect_done(rx: &mut mpsc::Receiver<GenUpdate>, slot: &mut Option<Done>) {

@@ -390,15 +390,15 @@ B5       24.01 tok/s  p99 TTFT 12.3 s  p50 TTFT 8.0 s
 
 ## Prefix cache: one shared system prefix, sharing on and off
 
-Not a sweep and not a steady-state run. One sample each. Warmup 1 (dropped from the histograms; it does fill the prefix cache when sharing is on) and **8** measured requests, seed 1, offered load 2 req/s, `max_tokens` 8, temperature 0, `--max-batch-size` 4, `--num-blocks` 256. Both cells returned 8 ok, 0 errors, and 16 output tokens. The model stopped on EOS before `max_tokens`, so this is not an 8-token generation. p99 of 8 points is the slow top of that sample. Output tok/s includes the Poisson gaps.
+Not a sweep and not a steady-state run. One sample each. `ServerConfig::prefix_cache` defaults to **true**. Sharing off is the same binary with `--no-prefix-cache`. Warmup 1 is dropped from the histograms and, with sharing on, fills the cache before the measured requests. **50** measured requests, seed 1, offered load 2 req/s, `max_tokens` 16, temperature 0, `--max-batch-size` 4, `--max-waiting` 64, `--num-blocks` 256. Both cells returned 50 ok, 0 errors, and 800 output tokens, which is 16 per request. Every request hit the cap (`finish_reason` length on a probe of each suffix). p99 of 50 points is still one sample. Output tok/s includes the Poisson gaps. At 2 req/s the requests queue, so TTFT here is queueing plus prefill, not an unloaded prefill.
 
-The system string is `"amber "` repeated 90 times (91 tokens). The chat template puts 99 tokens on the wire before the user suffix, so the first six blocks (96 tokens) are full and shared. The user suffix is one of `alpha`, `bravo`, `charlie`, `delta`, drawn by `prefix_suffixes(1, 8)`, which is indexes 3, 3, 3, 2, 0, 1, 0, 0. The partial block that contains the suffix is private. Sharing off is the same server with `--no-prefix-cache`.
+The system string is `Count upward by ones, separated by spaces, and do not stop early. ` repeated 6 times (91 tokens). The chat template puts 99 tokens on the wire before the user suffix, so the first six blocks (96 tokens) are full and shared. The user suffix is one of four "list two hundred integers starting at N" lines, for N in 1, 40, 80, 120. `prefix_suffixes(1, 50)` draws them. The block that contains the suffix is private, because admit looks up every token except the last.
 
 ```
 cargo build --release -p qwen-server -p loadgen
-target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size 4 --max-waiting 16 --num-blocks 256
-target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size 4 --max-waiting 16 --num-blocks 256 --no-prefix-cache
-target/release/loadgen --url http://127.0.0.1:18080/v1/chat/completions --requests 8 --rate 2 --seed 1 --warmup 1 --workload prefix
+target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size 4 --max-waiting 64 --num-blocks 256
+target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size 4 --max-waiting 64 --num-blocks 256 --no-prefix-cache
+target/release/loadgen --url http://127.0.0.1:18080/v1/chat/completions --requests 50 --rate 2 --seed 1 --warmup 1 --workload prefix
 ```
 
 Model: Qwen/Qwen2.5-0.5B-Instruct, f32, `Device::Cpu`. Measured 2026-11-11, rustc 1.99.1 (58cf8f9c3 2026-10-13). Same machine as the B6 rows.
@@ -407,11 +407,11 @@ Model: Qwen/Qwen2.5-0.5B-Instruct, f32, `Device::Cpu`. Measured 2026-11-11, rust
 - 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores, one socket.
 - MemTotal 16,387,328 kB
 
-`peak_live` is the most blocks that had a positive refcount at once, printed when the process stopped. Cached blocks at refcount 0 are not in that count.
+`peak_live` is the most blocks with a positive refcount. `peak_occupied` is the most blocks off the free stack, which adds refcount-0 cached prefix blocks. Both are read from engine stats when the process stops.
 
-| sharing | n | output tok/s | req/s | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 | e2e p99 | peak live blocks |
-|---|---|---|---|---|---|---|---|---|---|
-| on | 8 | 3.6527 | 1.8263 | 0.144 s | 0.445 s | 0.183 s | 0.511 s | 1.632 s | 9 |
-| off | 8 | 2.9230 | 1.4615 | 0.481 s | 1.325 s | 0.186 s | 1.108 s | 3.449 s | 28 |
+| sharing | n | output tok/s | req/s | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 | e2e p99 | peak live | peak occupied |
+|---|---|---|---|---|---|---|---|---|---|---|
+| on | 50 | 24.0860 | 1.5054 | 4.850 s | 6.582 s | 0.120 s | 0.331 s | 8.790 s | 16 | 17 |
+| off | 50 | 16.5954 | 1.0372 | 11.452 s | 21.053 s | 0.119 s | 0.999 s | 23.036 s | 35 | 35 |
 
-With sharing on, TTFT p50 is 0.144 s against 0.481 s off, and the pool's peak live blocks are 9 against 28. One sample of 8 requests. The warmup request is why the measured rows already hit the cache.
+Sharing on keeps TTFT p50 at 4.850 s against 11.452 s off, and peak live blocks at 16 against 35. The extra occupied block on the sharing-on row is a refcount-0 cache hit. One sample. The warmup is why later requests already find the prefix.

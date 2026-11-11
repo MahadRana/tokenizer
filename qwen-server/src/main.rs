@@ -44,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
     );
     tokio::signal::ctrl_c().await?;
     eprintln!("shutting down");
-    server.shutdown().await;
+    let stats = server.shutdown().await;
+    eprintln!(
+        "prefix peak_live {} peak_occupied {}",
+        stats.peak_blocks, stats.peak_occupied
+    );
     Ok(())
 }
 
