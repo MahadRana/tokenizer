@@ -16,6 +16,8 @@
 //! Debug builds assert the table is empty. The scheduler calls
 //! [`PagedCache::take_blocks`] and [`BlockAllocator::free_block`].
 
+use std::collections::{HashMap, VecDeque};
+
 use candle_core::{DType, Device, Result, Tensor, bail};
 
 /// Tokens in one physical block.
@@ -66,17 +68,53 @@ impl std::fmt::Display for AllocError {
 
 impl std::error::Error for AllocError {}
 
-/// Stack of free physical blocks.
+/// What [`BlockAllocator::free_block`] did with a live block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// Another sequence still holds this block. The KV stays.
+    Shared,
+    /// Refcount hit 0 and the block is a full prefix block. It stays out of
+    /// the free stack so a later hash hit can reuse the KV. [`BlockAllocator::alloc`]
+    /// evicts these, oldest first, before a caller has to preempt a live sequence.
+    Cached,
+    /// Refcount hit 0 and the block was private. It is back on the free stack.
+    /// The caller should clear the KV.
+    Freed,
+}
+
+/// Hash of one full block. `parent` is the previous block's hash, or 0 for
+/// the first block. The token ids are mixed in, and a lookup still compares
+/// the stored ids, so two different blocks that land on the same hash do not share.
+pub fn prefix_block_hash(parent: u64, tokens: &[u32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64 ^ parent;
+    for token in tokens {
+        hash ^= u64::from(*token);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+struct PrefixEntry {
+    id: BlockId,
+    tokens: [u32; BLOCK_SIZE],
+}
+
+/// Stack of free physical blocks, plus a refcount and a prefix index.
 ///
-/// Blocks are one size, so a free count of `n` can always satisfy `alloc_n(n)`.
-/// There is no external fragmentation. The only waste is the partial last
-/// block of each sequence, which is under one block.
+/// `alloc` pops the free stack. A published full block whose refcount falls
+/// to 0 is not pushed there: it stays in the prefix index until a later
+/// `alloc` evicts it. Private blocks (anything not published) return to the
+/// free stack at refcount 0, which is what the older tests do.
 pub struct BlockAllocator {
     free: Vec<BlockId>,
-    /// `true` while `id` sits on `free`. A second free is [`AllocError::DoubleFree`]
-    /// and does not push again.
-    is_free: Vec<bool>,
+    refcount: Vec<u32>,
+    /// Hash of a published full block, if this id is in `index`.
+    hash_of: Vec<Option<u64>>,
     capacity: u32,
+    /// Published blocks with refcount 0, oldest at the front.
+    cached: VecDeque<BlockId>,
+    index: HashMap<u64, PrefixEntry>,
+    peak_live: usize,
 }
 
 impl BlockAllocator {
@@ -86,10 +124,15 @@ impl BlockAllocator {
         for id in (0..num_blocks).rev() {
             free.push(BlockId(id));
         }
+        let n = num_blocks as usize;
         Self {
             free,
-            is_free: vec![true; num_blocks as usize],
+            refcount: vec![0; n],
+            hash_of: vec![None; n],
             capacity: num_blocks,
+            cached: VecDeque::new(),
+            index: HashMap::new(),
+            peak_live: 0,
         }
     }
 
@@ -97,47 +140,224 @@ impl BlockAllocator {
         self.capacity as usize
     }
 
+    /// Ids on the free stack. Cached prefix blocks are not included.
     pub fn free_count(&self) -> usize {
         self.free.len()
     }
 
-    /// Pop one id. `None` when every block is in use.
+    /// Free stack plus cached prefix blocks. Both can satisfy [`Self::alloc`].
+    pub fn available(&self) -> usize {
+        self.free.len() + self.cached.len()
+    }
+
+    pub fn cached_count(&self) -> usize {
+        self.cached.len()
+    }
+
+    pub fn refcount(&self, id: BlockId) -> Option<u32> {
+        self.refcount.get(id.index()).copied()
+    }
+
+    pub fn live_count(&self) -> usize {
+        self.refcount.iter().filter(|count| **count > 0).count()
+    }
+
+    pub fn peak_live(&self) -> usize {
+        self.peak_live
+    }
+
+    pub fn all_refcounts_zero(&self) -> bool {
+        self.refcount.iter().all(|count| *count == 0)
+    }
+
+    /// Pop one id, from the free stack or by evicting the oldest cached block.
+    /// `None` when every block has a positive refcount.
     pub fn alloc(&mut self) -> Option<BlockId> {
-        let id = self.free.pop()?;
-        self.is_free[id.index()] = false;
+        if let Some(id) = self.free.pop() {
+            self.refcount[id.index()] = 1;
+            self.note_live();
+            return Some(id);
+        }
+        let id = self.cached.pop_front()?;
+        self.unindex(id);
+        debug_assert_eq!(self.refcount[id.index()], 0);
+        self.refcount[id.index()] = 1;
+        self.note_live();
         Some(id)
     }
 
     /// Pop `n` ids, or pop none.
     ///
-    /// A short free list does not move. `n == 0` returns an empty `Vec` and
-    /// leaves the stack alone.
+    /// A short pool does not move. `n == 0` returns an empty `Vec`. Cached
+    /// prefix blocks are evicted after the free stack runs out.
     pub fn alloc_n(&mut self, n: usize) -> Option<Vec<BlockId>> {
-        if self.free.len() < n {
+        if self.available() < n {
             return None;
         }
-        let start = self.free.len() - n;
-        let mut ids = self.free.split_off(start);
-        // `split_off` keeps stack order. `n` pops yield that slice reversed.
-        ids.reverse();
-        for id in &ids {
-            self.is_free[id.index()] = false;
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            ids.push(self.alloc().expect("available was checked"));
         }
         Some(ids)
     }
 
-    /// Push `id` back. A second push of the same id is an error and does not
-    /// grow the stack.
-    pub fn free_block(&mut self, id: BlockId) -> std::result::Result<(), AllocError> {
-        let Some(slot) = self.is_free.get_mut(id.index()) else {
+    /// Drop one reference. A second drop at refcount 0 is [`AllocError::DoubleFree`]
+    /// and does not push the id again.
+    pub fn free_block(&mut self, id: BlockId) -> std::result::Result<Release, AllocError> {
+        let Some(slot) = self.refcount.get_mut(id.index()) else {
             return Err(AllocError::Unknown(id));
         };
-        if *slot {
+        if *slot == 0 {
             return Err(AllocError::DoubleFree(id));
         }
-        *slot = true;
-        self.free.push(id);
+        *slot -= 1;
+        if *slot > 0 {
+            return Ok(Release::Shared);
+        }
+        if self.hash_of[id.index()].is_some() {
+            self.cached.push_back(id);
+            Ok(Release::Cached)
+        } else {
+            self.free.push(id);
+            Ok(Release::Freed)
+        }
+    }
+
+    /// One more holder. A cached block leaves the LRU list. A free-stack id
+    /// is not a valid target.
+    pub fn incref(&mut self, id: BlockId) -> std::result::Result<(), AllocError> {
+        let Some(slot) = self.refcount.get_mut(id.index()) else {
+            return Err(AllocError::Unknown(id));
+        };
+        if *slot == 0 {
+            let cached = self.cached.iter().position(|block| *block == id);
+            let Some(pos) = cached else {
+                return Err(AllocError::DoubleFree(id));
+            };
+            self.cached.remove(pos);
+            *slot = 1;
+            self.note_live();
+            return Ok(());
+        }
+        *slot += 1;
         Ok(())
+    }
+
+    /// Record a full block under `prefix_block_hash(parent, tokens)`.
+    ///
+    /// A hash that already stores different token ids is left alone. The new
+    /// block is not shared and is not indexed, so a collision cannot hand
+    /// out the wrong KV.
+    pub fn publish_full_block(
+        &mut self,
+        parent: u64,
+        tokens: &[u32],
+        id: BlockId,
+    ) -> std::result::Result<(), AllocError> {
+        if tokens.len() != BLOCK_SIZE {
+            return Err(AllocError::Unknown(id));
+        }
+        if self.refcount.get(id.index()).copied().unwrap_or(0) == 0 {
+            return Err(AllocError::Unknown(id));
+        }
+        self.publish_at_hash(prefix_block_hash(parent, tokens), tokens, id);
+        Ok(())
+    }
+
+    /// Full blocks of `tokens` that are already published, in order.
+    ///
+    /// Each hit bumps that block's refcount. The walk stops at the first
+    /// miss, so a prompt that diverges inside a block keeps only the earlier
+    /// full blocks. The partial tail is never looked up.
+    pub fn take_shared_prefix(&mut self, tokens: &[u32]) -> Vec<BlockId> {
+        let mut parent = 0u64;
+        let mut shared = Vec::new();
+        let mut offset = 0;
+        while offset + BLOCK_SIZE <= tokens.len() {
+            let chunk = &tokens[offset..offset + BLOCK_SIZE];
+            let Some(id) = self.find_full_block(parent, chunk) else {
+                break;
+            };
+            if self.incref(id).is_err() {
+                break;
+            }
+            shared.push(id);
+            parent = prefix_block_hash(parent, chunk);
+            offset += BLOCK_SIZE;
+        }
+        shared
+    }
+
+    /// Index every full block of `tokens`. `blocks[i]` holds tokens
+    /// `[i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE)`. A short tail is ignored.
+    pub fn publish_prompt_blocks(&mut self, tokens: &[u32], blocks: &[BlockId]) {
+        let full = tokens.len() / BLOCK_SIZE;
+        let mut parent = 0u64;
+        for index in 0..full {
+            if index >= blocks.len() {
+                break;
+            }
+            let chunk = &tokens[index * BLOCK_SIZE..(index + 1) * BLOCK_SIZE];
+            let _ = self.publish_full_block(parent, chunk, blocks[index]);
+            parent = prefix_block_hash(parent, chunk);
+        }
+    }
+
+    /// A published block with these exact token ids, if the hash hits.
+    pub fn find_full_block(&self, parent: u64, tokens: &[u32]) -> Option<BlockId> {
+        if tokens.len() != BLOCK_SIZE {
+            return None;
+        }
+        self.find_at_hash(prefix_block_hash(parent, tokens), tokens)
+    }
+
+    /// Drop every cached prefix block onto the free stack.
+    ///
+    /// Refcounts are already 0. Shutdown uses this so `free_count` covers
+    /// the whole pool once no sequence is alive.
+    pub fn reclaim_cached(&mut self) {
+        while let Some(id) = self.cached.pop_front() {
+            self.unindex(id);
+            debug_assert_eq!(self.refcount[id.index()], 0);
+            self.free.push(id);
+        }
+    }
+
+    fn publish_at_hash(&mut self, hash: u64, tokens: &[u32], id: BlockId) -> bool {
+        debug_assert_eq!(tokens.len(), BLOCK_SIZE);
+        if let Some(existing) = self.index.get(&hash) {
+            return existing.tokens.as_slice() == tokens && existing.id == id;
+        }
+        if self.hash_of[id.index()].is_some() {
+            return false;
+        }
+        let mut stored = [0u32; BLOCK_SIZE];
+        stored.copy_from_slice(tokens);
+        self.index.insert(hash, PrefixEntry { id, tokens: stored });
+        self.hash_of[id.index()] = Some(hash);
+        true
+    }
+
+    fn find_at_hash(&self, hash: u64, tokens: &[u32]) -> Option<BlockId> {
+        let entry = self.index.get(&hash)?;
+        if entry.tokens.as_slice() == tokens {
+            Some(entry.id)
+        } else {
+            None
+        }
+    }
+
+    fn unindex(&mut self, id: BlockId) {
+        if let Some(hash) = self.hash_of[id.index()].take()
+            && self.index.get(&hash).is_some_and(|entry| entry.id == id)
+        {
+            self.index.remove(&hash);
+        }
+    }
+
+    fn note_live(&mut self) {
+        let live = self.live_count();
+        self.peak_live = self.peak_live.max(live);
     }
 }
 
@@ -690,6 +910,95 @@ mod tests {
 
     fn pattern_value(token: usize, head: usize, dim: usize) -> f32 {
         (token * 100 + head * 10 + dim) as f32
+    }
+
+    #[test]
+    fn shared_prefix_uses_fewer_blocks_than_two_copies() {
+        let prompt = vec![3u32; 32];
+        let mut alloc = BlockAllocator::new(8);
+        let first = alloc.alloc_n(2).unwrap();
+        alloc.publish_prompt_blocks(&prompt, &first);
+        let shared = alloc.take_shared_prefix(&prompt);
+        assert_eq!(shared.len(), 2);
+        assert_eq!(
+            alloc.live_count(),
+            2,
+            "two private copies would take 4 blocks"
+        );
+        assert_eq!(alloc.refcount(first[0]), Some(2));
+        assert_eq!(alloc.refcount(first[1]), Some(2));
+        assert_eq!(alloc.peak_live(), 2);
+        for id in first.into_iter().chain(shared) {
+            alloc.free_block(id).unwrap();
+        }
+        assert!(alloc.all_refcounts_zero());
+        assert_eq!(alloc.cached_count(), 2);
+        alloc.reclaim_cached();
+        assert_eq!(alloc.free_count(), alloc.capacity());
+    }
+
+    #[test]
+    fn hash_collision_does_not_share() {
+        let mut alloc = BlockAllocator::new(4);
+        let id = alloc.alloc().unwrap();
+        let other_id = alloc.alloc().unwrap();
+        let stored = [1u32; BLOCK_SIZE];
+        let other = [2u32; BLOCK_SIZE];
+        assert!(alloc.publish_at_hash(7, &stored, id));
+        assert!(!alloc.publish_at_hash(7, &other, other_id));
+        assert_eq!(alloc.find_at_hash(7, &other), None);
+        assert_eq!(alloc.find_at_hash(7, &stored), Some(id));
+        assert_eq!(alloc.take_shared_prefix(&other), Vec::<BlockId>::new());
+        alloc.free_block(id).unwrap();
+        alloc.free_block(other_id).unwrap();
+        alloc.reclaim_cached();
+    }
+
+    #[test]
+    fn prompt_that_diverges_inside_a_block_shares_only_earlier_blocks() {
+        let mut left = vec![4u32; 20];
+        let mut right = left.clone();
+        right[17] = 9;
+        let mut alloc = BlockAllocator::new(4);
+        let blocks = alloc.alloc_n(2).unwrap();
+        alloc.publish_prompt_blocks(&left, &blocks);
+        let shared = alloc.take_shared_prefix(&right);
+        assert_eq!(shared, vec![blocks[0]]);
+        assert_eq!(alloc.refcount(blocks[0]), Some(2));
+        assert_eq!(alloc.refcount(blocks[1]), Some(1));
+        assert!(alloc.find_full_block(0, &left[..16]).is_some());
+        let parent = prefix_block_hash(0, &left[..16]);
+        assert!(alloc.find_full_block(parent, &right[16..]).is_none());
+        left[17] = 9;
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn dropping_one_sharer_leaves_the_block_held() {
+        let prompt = vec![8u32; 32];
+        let mut alloc = BlockAllocator::new(4);
+        let blocks = alloc.alloc_n(2).unwrap();
+        alloc.publish_prompt_blocks(&prompt, &blocks);
+        let shared = alloc.take_shared_prefix(&prompt);
+        assert_eq!(alloc.free_block(blocks[0]).unwrap(), Release::Shared);
+        assert_eq!(alloc.free_block(blocks[1]).unwrap(), Release::Shared);
+        assert_eq!(alloc.refcount(shared[0]), Some(1));
+        assert_eq!(alloc.live_count(), 2);
+        assert!(alloc.alloc().is_some());
+        assert_ne!(alloc.free_count(), alloc.capacity());
+    }
+
+    #[test]
+    fn alloc_evicts_cached_blocks_before_it_returns_none() {
+        let prompt = vec![5u32; 16];
+        let mut alloc = BlockAllocator::new(1);
+        let id = alloc.alloc().unwrap();
+        alloc.publish_full_block(0, &prompt, id).unwrap();
+        assert_eq!(alloc.free_block(id).unwrap(), Release::Cached);
+        assert!(alloc.alloc().is_some());
+        assert_eq!(alloc.live_count(), 1);
+        assert!(alloc.find_full_block(0, &prompt).is_none());
+        assert_eq!(alloc.cached_count(), 0);
     }
 
     fn pattern_tokens(pos: usize, seq: usize, kv_heads: usize, head_dim: usize) -> Tensor {
