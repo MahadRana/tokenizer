@@ -307,13 +307,44 @@ pub fn summarize(samples: &[Sample], wall: Duration) -> Report {
     }
 }
 
+/// System text for the prefix-sharing cell. `"amber "` ninety times is 91
+/// tokens. After the Qwen chat template the bytes before the user suffix are
+/// 99 tokens, so the first six blocks (96 tokens) are a shared full prefix.
+pub fn prefix_system() -> String {
+    "amber ".repeat(90)
+}
+
+/// User suffixes for [`Workload::Prefix`]. The system text stays put.
+pub const PREFIX_SUFFIXES: [&str; 4] = ["alpha", "bravo", "charlie", "delta"];
+
+pub const PREFIX_MAX_TOKENS: u32 = 8;
+
+/// Suffix index for each measured prefix-sharing request.
+///
+/// A second `StdRng` seeded with `seed`, same rule as [`mix_assignments`].
+pub fn prefix_suffixes(seed: u64, n: usize) -> Vec<usize> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..n)
+        .map(|_| rng.random_range(0..PREFIX_SUFFIXES.len()))
+        .collect()
+}
+
 /// What each request sends. `Mix` is the seeded benchmark distribution.
+/// `Prefix` keeps one system string and varies the user suffix.
 /// `Fixed` is one string and one `max_tokens`, used by the mock test path
 /// and by a manual run.
 #[derive(Debug, Clone)]
 pub enum Workload {
     Fixed { prompt: String, max_tokens: u32 },
     Mix,
+    Prefix,
+}
+
+#[derive(Clone)]
+struct Outbound {
+    system: Option<String>,
+    user: String,
+    max_tokens: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -340,14 +371,15 @@ pub async fn run_load(config: LoadConfig) -> Result<Report, String> {
         .timeout(Duration::from_secs(900))
         .build()
         .map_err(|err| err.to_string())?;
-    let (warm_prompt, warm_tokens) = warmup_job(&config.workload);
+    let warm = warmup_job(&config.workload);
     if config.warmup > 0 {
         let warm = one_request(
             &client,
             &config.url,
             &config.model,
-            &warm_prompt,
-            warm_tokens,
+            warm.system.as_deref(),
+            &warm.user,
+            warm.max_tokens,
         )
         .await;
         if let Some(err) = warm.error {
@@ -361,7 +393,7 @@ pub async fn run_load(config: LoadConfig) -> Result<Report, String> {
     let origin = tokio::time::Instant::now();
     let wall_start = Instant::now();
     let mut cursor = Duration::ZERO;
-    for (index, (prompt, max_tokens)) in jobs.into_iter().enumerate() {
+    for (index, job) in jobs.into_iter().enumerate() {
         if index > 0 {
             cursor += Duration::from_secs_f64(gaps[index - 1]);
         }
@@ -372,7 +404,15 @@ pub async fn run_load(config: LoadConfig) -> Result<Report, String> {
         let model = config.model.clone();
         tokio::spawn(async move {
             tokio::time::sleep_until(when).await;
-            let sample = one_request(&client, &url, &model, &prompt, max_tokens).await;
+            let sample = one_request(
+                &client,
+                &url,
+                &model,
+                job.system.as_deref(),
+                &job.user,
+                job.max_tokens,
+            )
+            .await;
             let _ = tx.send(sample).await;
         });
     }
@@ -384,23 +424,58 @@ pub async fn run_load(config: LoadConfig) -> Result<Report, String> {
     Ok(summarize(&samples, wall_start.elapsed()))
 }
 
-fn warmup_job(workload: &Workload) -> (String, u32) {
+fn warmup_job(workload: &Workload) -> Outbound {
     match workload {
-        Workload::Fixed { prompt, max_tokens } => (prompt.clone(), *max_tokens),
-        Workload::Mix => (mix_user(MIX[0].repeats), MIX[0].max_tokens),
+        Workload::Fixed { prompt, max_tokens } => Outbound {
+            system: None,
+            user: prompt.clone(),
+            max_tokens: *max_tokens,
+        },
+        Workload::Mix => Outbound {
+            system: None,
+            user: mix_user(MIX[0].repeats),
+            max_tokens: MIX[0].max_tokens,
+        },
+        Workload::Prefix => Outbound {
+            system: Some(prefix_system()),
+            user: PREFIX_SUFFIXES[0].to_string(),
+            max_tokens: PREFIX_MAX_TOKENS,
+        },
     }
 }
 
-fn measured_jobs(workload: &Workload, seed: u64, n: usize) -> Vec<(String, u32)> {
+fn measured_jobs(workload: &Workload, seed: u64, n: usize) -> Vec<Outbound> {
     match workload {
-        Workload::Fixed { prompt, max_tokens } => vec![(prompt.clone(), *max_tokens); n],
+        Workload::Fixed { prompt, max_tokens } => vec![
+            Outbound {
+                system: None,
+                user: prompt.clone(),
+                max_tokens: *max_tokens,
+            };
+            n
+        ],
         Workload::Mix => mix_assignments(seed, n)
             .into_iter()
             .map(|index| {
                 let entry = &MIX[index];
-                (mix_user(entry.repeats), entry.max_tokens)
+                Outbound {
+                    system: None,
+                    user: mix_user(entry.repeats),
+                    max_tokens: entry.max_tokens,
+                }
             })
             .collect(),
+        Workload::Prefix => {
+            let system = prefix_system();
+            prefix_suffixes(seed, n)
+                .into_iter()
+                .map(|index| Outbound {
+                    system: Some(system.clone()),
+                    user: PREFIX_SUFFIXES[index].to_string(),
+                    max_tokens: PREFIX_MAX_TOKENS,
+                })
+                .collect()
+        }
     }
 }
 
@@ -408,12 +483,18 @@ async fn one_request(
     client: &Client,
     url: &str,
     model: &str,
+    system: Option<&str>,
     prompt: &str,
     max_tokens: u32,
 ) -> Sample {
+    let mut messages = Vec::new();
+    if let Some(system) = system {
+        messages.push(serde_json::json!({"role": "system", "content": system}));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": prompt}));
     let body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0,
         "stream": true,
@@ -593,6 +674,15 @@ mod tests {
         assert_ne!(plan, mix_assignments(2, 50));
         // First eight draws of StdRng::seed_from_u64(1) over 0..4.
         assert_eq!(&plan[..8], &[3, 3, 3, 2, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn prefix_suffixes_replay_for_a_fixed_seed() {
+        assert_eq!(prefix_system().matches("amber ").count(), 90);
+        let plan = prefix_suffixes(1, 8);
+        assert_eq!(plan, prefix_suffixes(1, 8));
+        assert!(plan.iter().all(|index| *index < PREFIX_SUFFIXES.len()));
+        assert_eq!(PREFIX_MAX_TOKENS, 8);
     }
 
     #[test]
