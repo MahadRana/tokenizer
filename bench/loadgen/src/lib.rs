@@ -307,17 +307,25 @@ pub fn summarize(samples: &[Sample], wall: Duration) -> Report {
     }
 }
 
-/// System text for the prefix-sharing cell. `"amber "` ninety times is 91
-/// tokens. After the Qwen chat template the bytes before the user suffix are
-/// 99 tokens, so the first six blocks (96 tokens) are a shared full prefix.
+/// System text for the prefix-sharing cell.
+///
+/// Six copies are 91 tokens. After the Qwen chat template, the tokens before
+/// the user suffix are 99, so the first six blocks (96 tokens) sit entirely
+/// inside the shared prefix. The sentence asks the model to keep counting, so
+/// a request runs out to `max_tokens` instead of stopping on EOS.
 pub fn prefix_system() -> String {
-    "amber ".repeat(90)
+    "Count upward by ones, separated by spaces, and do not stop early. ".repeat(6)
 }
 
 /// User suffixes for [`Workload::Prefix`]. The system text stays put.
-pub const PREFIX_SUFFIXES: [&str; 4] = ["alpha", "bravo", "charlie", "delta"];
+pub const PREFIX_SUFFIXES: [&str; 4] = [
+    "List two hundred integers starting at 1, separated by spaces.",
+    "List two hundred integers starting at 40, separated by spaces.",
+    "List two hundred integers starting at 80, separated by spaces.",
+    "List two hundred integers starting at 120, separated by spaces.",
+];
 
-pub const PREFIX_MAX_TOKENS: u32 = 8;
+pub const PREFIX_MAX_TOKENS: u32 = 16;
 
 /// Suffix index for each measured prefix-sharing request.
 ///
@@ -678,11 +686,11 @@ mod tests {
 
     #[test]
     fn prefix_suffixes_replay_for_a_fixed_seed() {
-        assert_eq!(prefix_system().matches("amber ").count(), 90);
+        assert_eq!(prefix_system().matches("Count upward").count(), 6);
         let plan = prefix_suffixes(1, 8);
         assert_eq!(plan, prefix_suffixes(1, 8));
         assert!(plan.iter().all(|index| *index < PREFIX_SUFFIXES.len()));
-        assert_eq!(PREFIX_MAX_TOKENS, 8);
+        assert_eq!(PREFIX_MAX_TOKENS, 16);
     }
 
     #[test]
