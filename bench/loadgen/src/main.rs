@@ -19,11 +19,12 @@ async fn main() -> ExitCode {
     let mut model = "Qwen/Qwen2.5-0.5B-Instruct".to_string();
     let mut warmup = 1usize;
     let mut mix = false;
+    let mut prefix = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: loadgen [--url URL] [--requests 8] [--rate 1] [--seed 1] [--prompt Hi] [--max-tokens 4] [--warmup 1] [--model ID] [--workload mix]"
+                    "usage: loadgen [--url URL] [--requests 8] [--rate 1] [--seed 1] [--prompt Hi] [--max-tokens 4] [--warmup 1] [--model ID] [--workload mix|prefix]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -37,11 +38,12 @@ async fn main() -> ExitCode {
             "--warmup" => warmup = parse_num(&mut args, "--warmup"),
             "--workload" => {
                 let value = need(&mut args, "--workload");
-                if value != "mix" {
-                    eprintln!("--workload must be mix");
+                if value != "mix" && value != "prefix" {
+                    eprintln!("--workload must be mix or prefix");
                     return ExitCode::from(2);
                 }
-                mix = true;
+                mix = value == "mix";
+                prefix = value == "prefix";
             }
             other => {
                 eprintln!("unknown argument {other}");
@@ -49,7 +51,9 @@ async fn main() -> ExitCode {
             }
         }
     }
-    let workload = if mix {
+    let workload = if prefix {
+        loadgen::Workload::Prefix
+    } else if mix {
         loadgen::Workload::Mix
     } else {
         loadgen::Workload::Fixed { prompt, max_tokens }
