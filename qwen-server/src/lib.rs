@@ -37,6 +37,11 @@ pub struct ServerConfig {
     /// [`qwen_infer::BLOCK_SIZE`] tokens. The default is 256 blocks, which is
     /// 4096 tokens of cache.
     pub num_blocks: usize,
+    /// Reuse full prompt blocks when a later request has the same prefix.
+    /// Lookup skips the last token, so the block that contains it is private
+    /// for this request. A longer prompt that extends these tokens can still
+    /// hit that block, which is why it is published.
+    pub prefix_cache: bool,
 }
 
 impl Default for ServerConfig {
@@ -45,6 +50,7 @@ impl Default for ServerConfig {
             max_batch_size: 8,
             max_waiting: 32,
             num_blocks: 256,
+            prefix_cache: true,
         }
     }
 }
@@ -194,6 +200,7 @@ pub async fn serve_with(
             let codec = Arc::clone(&codec);
             let inflight = Arc::clone(&inflight);
             let max_batch_size = config.max_batch_size;
+            let prefix_cache = config.prefix_cache;
             move || {
                 engine_thread(
                     req_rx,
@@ -204,6 +211,7 @@ pub async fn serve_with(
                     inflight,
                     max_batch_size,
                     pool,
+                    prefix_cache,
                 )
             }
         })

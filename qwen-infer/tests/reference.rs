@@ -409,6 +409,144 @@ fn paged_equals_contiguous() {
     assert_eq!(alloc.free_count(), alloc.capacity());
 }
 
+/// Greedy tokens with a shared 32-token prefix match a private paged prefill.
+///
+/// The first prompt fills the prefix blocks. The second reuses them and
+/// prefills only its suffix. Logits of that suffix step stay within 1e-4 of
+/// a private prefill, and the greedy ids match.
+#[test]
+#[ignore = "downloads Qwen2.5-0.5B-Instruct and compares shared and private prefills"]
+fn prefix_share_matches_private_greedy() {
+    let (model, tok, _meta) = load_qwen();
+    let piece = tok.encode("The capital of France is").unwrap();
+    let mut prefix = piece.clone();
+    while prefix.len() < 32 {
+        prefix.extend_from_slice(&piece);
+    }
+    prefix.truncate(32);
+    let mut prompt_a = prefix.clone();
+    prompt_a.extend(tok.encode(" today").unwrap());
+    let mut prompt_b = prefix.clone();
+    prompt_b.extend(tok.encode(" tomorrow").unwrap());
+    assert_eq!(&prompt_a[..32], &prompt_b[..32]);
+    assert_ne!(prompt_a, prompt_b);
+    let steps = 4usize;
+
+    let (tokens_b, logits_b) = private_greedy(&model, &prompt_b, steps);
+
+    let blocks = 64u32;
+    let pool = model.kv_pool(blocks as usize).unwrap();
+    let mut alloc = qwen_infer::BlockAllocator::new(blocks);
+    let mut cache_a = qwen_infer::PagedCache::new(model.num_layers());
+    cache_a.assign_blocks(
+        alloc
+            .alloc_n(qwen_infer::blocks_for_len(prompt_a.len()))
+            .unwrap(),
+    );
+    model
+        .forward_paged(&prompt_a, 0, &mut cache_a, &pool)
+        .unwrap();
+    alloc.publish_prompt_blocks(&prompt_a, cache_a.block_table());
+
+    let shared = alloc.take_shared_prefix(&prompt_b);
+    assert_eq!(shared.len(), 2, "32 tokens are two full blocks");
+    assert!(
+        alloc.live_count()
+            < qwen_infer::blocks_for_len(prompt_a.len())
+                + qwen_infer::blocks_for_len(prompt_b.len()),
+        "shared blocks counted twice"
+    );
+    let mut cache_b = qwen_infer::PagedCache::new(model.num_layers());
+    let total = qwen_infer::blocks_for_len(prompt_b.len() + steps);
+    let fresh = total - shared.len();
+    let mut ids = shared;
+    ids.extend(alloc.alloc_n(fresh).unwrap());
+    cache_b.assign_blocks(ids);
+    cache_b.set_seq_len(32);
+    let shared_logits = model
+        .forward_paged(&prompt_b[32..], 32, &mut cache_b, &pool)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let diff = max_abs_row(&shared_logits, &logits_b);
+    assert!(
+        diff <= 1e-4,
+        "shared suffix vs private prefill max abs {diff}"
+    );
+    let mut row = shared_logits;
+    let mut tokens = Vec::new();
+    for _ in 0..steps {
+        let id = qwen_infer::greedy_token(&row).unwrap();
+        tokens.push(id);
+        let need = qwen_infer::blocks_for_len(cache_b.seq_len() + 1);
+        if cache_b.block_count() < need {
+            cache_b.assign_blocks(alloc.alloc_n(need - cache_b.block_count()).unwrap());
+        }
+        let mut refs = [&mut cache_b];
+        row = model
+            .forward_decode_batch_paged(&[id], &mut refs, &pool)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+            .pop()
+            .unwrap();
+    }
+    assert_eq!(tokens, tokens_b);
+    eprintln!("real-weight prefix share vs private max abs {diff}");
+    for id in cache_a.take_blocks() {
+        alloc.free_block(id).unwrap();
+    }
+    for id in cache_b.take_blocks() {
+        alloc.free_block(id).unwrap();
+    }
+    assert!(alloc.all_refcounts_zero());
+    alloc.reclaim_cached();
+    assert_eq!(alloc.free_count(), alloc.capacity());
+}
+
+fn private_greedy(
+    model: &qwen_infer::QwenModel,
+    prompt: &[u32],
+    steps: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    let blocks = 64u32;
+    let pool = model.kv_pool(blocks as usize).unwrap();
+    let mut alloc = qwen_infer::BlockAllocator::new(blocks);
+    let mut cache = qwen_infer::PagedCache::new(model.num_layers());
+    cache.assign_blocks(
+        alloc
+            .alloc_n(qwen_infer::blocks_for_len(prompt.len() + steps))
+            .unwrap(),
+    );
+    let mut row = model
+        .forward_paged(prompt, 0, &mut cache, &pool)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let first = row.clone();
+    let mut tokens = Vec::new();
+    for _ in 0..steps {
+        let id = qwen_infer::greedy_token(&row).unwrap();
+        tokens.push(id);
+        let need = qwen_infer::blocks_for_len(cache.seq_len() + 1);
+        if cache.block_count() < need {
+            cache.assign_blocks(alloc.alloc_n(need - cache.block_count()).unwrap());
+        }
+        let mut refs = [&mut cache];
+        row = model
+            .forward_decode_batch_paged(&[id], &mut refs, &pool)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+            .pop()
+            .unwrap();
+    }
+    for id in cache.take_blocks() {
+        alloc.free_block(id).unwrap();
+    }
+    (tokens, first)
+}
+
 fn max_abs_row(left: &[f32], right: &[f32]) -> f32 {
     assert_eq!(left.len(), right.len());
     left.iter()

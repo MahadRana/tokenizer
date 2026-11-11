@@ -387,3 +387,35 @@ offered 1.0 req/s
 B4       26.08 tok/s  p99 TTFT 9.8 s   p50 TTFT 5.0 s
 B5       24.01 tok/s  p99 TTFT 12.3 s  p50 TTFT 8.0 s
 ```
+
+## Prefix cache: one shared system prefix, sharing on and off
+
+Not a sweep and not a steady-state run. One sample per cell. `ServerConfig::prefix_cache` defaults to **true**. Sharing off is the same binary with `--no-prefix-cache`. Warmup 1 is dropped from the histograms and, with sharing on, fills the cache before the measured requests. **50** measured requests, seed 1, `max_tokens` 16, temperature 0, `--max-batch-size` 4, `--max-waiting` 64, `--num-blocks` 256. Every cell returned 50 ok, 0 errors, and 800 output tokens, 16 per request. A probe of each suffix finished `length` at 16 tokens, and the cells match that count. p99 of 50 points is still one sample. Output tok/s includes the Poisson gaps. The **req/s** column is achieved throughput, not the offered rate.
+
+The system string is `Count upward by ones, separated by spaces, and do not stop early. ` repeated 6 times (91 tokens). The chat template puts 99 tokens on the wire before the user suffix, so the first six blocks (96 tokens) are full and shared. The user suffix is one of four "list two hundred integers starting at N" lines, for N in 1, 40, 80, 120. `prefix_suffixes(1, 50)` draws them. Lookup skips the last prompt token, so the block that contains it is private for that request. A longer prompt that extends the same tokens can still hit that block, which is why it stays in the index.
+
+```
+cargo build --release -p qwen-server -p loadgen
+target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size 4 --max-waiting 64 --num-blocks 256
+target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size 4 --max-waiting 64 --num-blocks 256 --no-prefix-cache
+target/release/loadgen --url http://127.0.0.1:18080/v1/chat/completions --requests 50 --rate <0.5 or 2> --seed 1 --warmup 1 --workload prefix
+```
+
+Model: Qwen/Qwen2.5-0.5B-Instruct, f32, `Device::Cpu`. Measured 2026-11-11, rustc 1.99.1 (58cf8f9c3 2026-10-13). Same machine as the B6 rows.
+
+- Linux 6.12.113+ x86_64, KVM guest
+- 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores, one socket.
+- MemTotal 16,387,328 kB
+
+`peak_live` is the most blocks with a positive refcount. `peak_occupied` is the most blocks off the free stack, which adds cached blocks whose refcount is 0. Both are read from engine stats when the process stops.
+
+0.5 req/s is below saturation: achieved req/s stays with the offer (0.4858 and 0.4838 against 0.5), and TTFT p50 is the prefill, not a queue. 2 req/s is overload. Achieved throughput there is 1.5054 req/s with sharing and 1.0372 without, both well under the offer, so that pair measures capacity.
+
+| load | sharing | n | output tok/s | achieved req/s | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 | e2e p99 | peak live | peak occupied |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0.5 req/s, below saturation | on | 50 | 7.7729 | 0.4858 | 0.198 s | 1.455 s | 0.113 s | 0.421 s | 3.482 s | 16 | 17 |
+| 0.5 req/s, below saturation | off | 50 | 7.7416 | 0.4838 | 0.534 s | 2.939 s | 0.118 s | 0.682 s | 6.189 s | 35 | 35 |
+| 2 req/s, overload | on | 50 | 24.0860 | 1.5054 | 4.850 s | 6.582 s | 0.120 s | 0.331 s | 8.790 s | 16 | 17 |
+| 2 req/s, overload | off | 50 | 16.5954 | 1.0372 | 11.452 s | 21.053 s | 0.119 s | 0.999 s | 23.036 s | 35 | 35 |
+
+Below saturation, sharing cuts TTFT p50 from 0.534 s to 0.198 s while achieved req/s stays on the offer. The tok/s at 0.5 req/s is almost the same on and off because the clock includes the idle gaps. Under overload, sharing raises achieved throughput from 1.0372 to 1.5054 req/s. Peak live blocks are 16 with sharing and 35 without, at both loads. The extra occupied block with sharing on is a cached block. One sample per cell. The warmup is why later requests already find the prefix.
