@@ -86,6 +86,13 @@ pub struct RankTokenizer {
     /// `tokenizer.json` normalizer is NFC. cl100k leaves this off: tiktoken
     /// does not normalize, and turning it on would change the A4 ids.
     normalize_nfc: bool,
+    /// Every encoder key round-trips through the merge loop:
+    /// `encode_bpe(bytes) == [id]`. A regex piece that is already one vocab
+    /// entry can be emitted as that id. [`RankTokenizer::load_cl100k`] sets
+    /// this. The ignored vocab round-trip test is what locks the property
+    /// for the published cl100k file. [`RankTokenizer::parse`] leaves it off:
+    /// a token can sit in the map without being reachable by merges.
+    piece_is_token: bool,
 }
 
 impl RankTokenizer {
@@ -117,6 +124,13 @@ impl RankTokenizer {
             }
         }
         tok.specials = cl100k_specials();
+        // The five cl100k specials all start with this prefix. The encode
+        // loop uses that to skip a specials-map probe on ordinary pieces.
+        debug_assert!(tok.specials.keys().all(|name| name.starts_with("<|")));
+        // Safe only because every mergeable token in this file encodes back
+        // to itself. `decode_encode_piece_round_trips_every_vocab_entry`
+        // checks that with `encode_bpe`, which does not take this path.
+        tok.piece_is_token = true;
         Ok(tok)
     }
 
@@ -129,14 +143,15 @@ impl RankTokenizer {
     /// regex yields no matches). A special token inside a longer piece is
     /// ordinary text here. [`RankTokenizer::encode`] splits those out before
     /// it calls this.
+    ///
+    /// On a cl100k tokenizer (`piece_is_token`), a piece whose bytes are
+    /// already one vocab entry is that id. The merge loop produces the same
+    /// id. Other vocabs always run the loop, including when the whole piece
+    /// happens to be in the map.
     pub fn encode_piece(&self, piece: &str) -> Vec<u32> {
-        if piece.is_empty() {
-            return Vec::new();
-        }
-        if let Some(&id) = self.specials.get(piece) {
-            return vec![id];
-        }
-        self.encode_bpe(piece.as_bytes())
+        let mut ids = Vec::new();
+        self.push_one_piece(piece, &mut ids);
+        ids
     }
 
     /// Encode `text`, allowing every registered special token.
@@ -270,6 +285,7 @@ impl RankTokenizer {
             pat: fancy_regex::Regex::new(CL100K_PAT)?,
             ranks: None,
             normalize_nfc: false,
+            piece_is_token: false,
         })
     }
 
@@ -302,6 +318,7 @@ impl RankTokenizer {
             pat: fancy_regex::Regex::new(pattern)?,
             ranks: Some(ranks),
             normalize_nfc: true,
+            piece_is_token: false,
         })
     }
 
@@ -375,13 +392,12 @@ impl RankTokenizer {
         Ok(ids)
     }
 
-    /// Regex-split `text` and append one `encode_piece` per match.
+    /// Regex-split `text` and append the ids of each piece.
     ///
     /// `find_iter` yields `Result<Match<'t>, Error>`. `'t` is the lifetime of
     /// `text`: `Match` stores that `&str`, and `as_str` returns a subslice of
-    /// it, not a borrow of the `Match` temporary. The collected `&str`s are
-    /// valid for the rest of this call and no longer. `collect::<Result<..>>`
-    /// turns the iterator of results into one `Result`, and `?` converts the
+    /// it. The cl100k path encodes that subslice before the next match, so
+    /// the `&str` does not have to outlive the loop. `?` converts a
     /// fancy-regex error.
     fn push_ordinary(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokenizerError> {
         if self.normalize_nfc {
@@ -397,26 +413,68 @@ impl RankTokenizer {
     }
 
     fn push_pieces(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokenizerError> {
-        let pieces = if self.ranks.is_some() {
+        if self.ranks.is_some() {
             // Qwen's Split behavior is `Isolated`: a gap the regex does not
             // cover is still a piece. cl100k's pattern is written to cover
             // every byte, and the existing encode only keeps matches.
-            self.pieces_keeping_gaps(text)?
-        } else {
-            self.pat
-                .find_iter(text)
-                .map(|mat| mat.map(|mat| mat.as_str()))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        debug_assert_eq!(
-            pieces.concat(),
-            text,
-            "pre-tokenizer left a gap or overlap in {text:?}"
-        );
-        for piece in pieces {
-            ids.extend(self.encode_piece(piece));
+            let pieces = self.pieces_keeping_gaps(text)?;
+            debug_assert_eq!(
+                pieces.concat(),
+                text,
+                "pre-tokenizer left a gap or overlap in {text:?}"
+            );
+            for piece in pieces {
+                self.push_one_piece(piece, ids);
+            }
+            return Ok(());
         }
+        // Stream matches into the output. Collecting every `&str` first is a
+        // second pass over the book and a vec of one pointer per piece.
+        let mut last = 0usize;
+        for mat in self.pat.find_iter(text) {
+            let mat = mat?;
+            let start = mat.start();
+            let end = mat.end();
+            debug_assert!(
+                start == last && end >= start,
+                "pre-tokenizer left a gap or overlap in {text:?}"
+            );
+            last = end;
+            self.push_one_piece(mat.as_str(), ids);
+        }
+        debug_assert_eq!(last, text.len(), "pre-tokenizer left a gap in {text:?}");
         Ok(())
+    }
+
+    /// Append the ids of one regex piece. No intermediate `Vec`.
+    ///
+    /// cl100k specials start with `<|`, so other pieces skip that map. A
+    /// piece that is already a vocab entry is one id (`piece_is_token`).
+    /// On this book that is about 151k of 163k pieces; the merge loop was
+    /// most of `encode`.
+    fn push_one_piece(&self, piece: &str, ids: &mut Vec<u32>) {
+        if piece.is_empty() {
+            return;
+        }
+        if self.piece_is_token {
+            if piece.starts_with("<|")
+                && let Some(&id) = self.specials.get(piece)
+            {
+                ids.push(id);
+                return;
+            }
+            if let Some(&id) = self.encoder.get(piece.as_bytes()) {
+                ids.push(id);
+                return;
+            }
+            self.encode_bpe_into(piece.as_bytes(), ids);
+            return;
+        }
+        if let Some(&id) = self.specials.get(piece) {
+            ids.push(id);
+            return;
+        }
+        self.encode_bpe_into(piece.as_bytes(), ids);
     }
 
     /// Regex matches plus the unmatched slices between them.
@@ -455,18 +513,33 @@ impl RankTokenizer {
         Ok(pieces)
     }
 
-    /// Byte-pair encode with no special-token match.
+    /// Owned ids for [`encode_bpe_into`](Self::encode_bpe_into). Tests call
+    /// this so the merge loop stays visible; `encode` appends in place.
+    #[cfg(test)]
+    fn encode_bpe(&self, piece: &[u8]) -> Vec<u32> {
+        let mut ids = Vec::new();
+        self.encode_bpe_into(piece, &mut ids);
+        ids
+    }
+
+    /// Byte-pair encode with no special-token match, appending to `ids`.
     ///
     /// Parts are a `Vec` of boundaries. Each merge rescans that vec for the
     /// lowest rank. Pieces are short (a regex chunk, or one vocab token), so
     /// the scan stays in cache. A heap would be less code-local and not
-    /// faster at these lengths.
-    fn encode_bpe(&self, piece: &[u8]) -> Vec<u32> {
+    /// faster at these lengths. On the book the longest piece is under 100
+    /// bytes, and pieces that are already one token never reach this loop.
+    ///
+    /// This does not consult `piece_is_token`. The cl100k round-trip test
+    /// calls [`encode_bpe`](Self::encode_bpe) on every vocab entry and checks
+    /// the merge loop itself.
+    fn encode_bpe_into(&self, piece: &[u8], ids: &mut Vec<u32>) {
         if piece.is_empty() {
-            return Vec::new();
+            return;
         }
         if piece.len() == 1 {
-            return vec![self.id_of(piece)];
+            ids.push(self.id_of(piece));
+            return;
         }
 
         let mut parts = Vec::with_capacity(piece.len() + 1);
@@ -506,11 +579,10 @@ impl RankTokenizer {
         }
 
         debug_assert!(parts.len() >= 2);
-        let mut ids = Vec::with_capacity(parts.len() - 1);
+        ids.reserve(parts.len() - 1);
         for window in parts.windows(2) {
             ids.push(self.id_of(&piece[window[0].start..window[1].start]));
         }
-        ids
     }
 
     /// Rank of `piece[parts[index].start .. parts[index + 3].start]`.
@@ -807,6 +879,10 @@ mod tests {
         // "abc" has a rank, but neither pair does, so nothing merges.
         let tok = vocab(&[(b"a", 0), (b"b", 1), (b"c", 2), (b"abc", 3)]);
         assert_eq!(tok.encode_piece("abc"), vec![0, 1, 2]);
+        // `parse` does not set `piece_is_token`, so full-text encode runs
+        // the same loop. The regex keeps "abc" as one piece.
+        assert!(!tok.piece_is_token);
+        assert_eq!(tok.encode("abc").unwrap(), vec![0, 1, 2]);
     }
 
     #[test]
