@@ -2417,6 +2417,56 @@ mod tests {
         }
     }
 
+    /// A sequence already in `Restore`, with a shared prefix attached, is a
+    /// legal preemption victim. `seq_len` is the prefix, not zero.
+    #[test]
+    fn restore_phase_sharer_can_be_preempted() {
+        let (model, pool) = tiny_pool(3);
+        let mut alloc = BlockAllocator::new(3);
+        let shared = alloc.alloc().unwrap();
+        let older_private = alloc.alloc().unwrap();
+        let victim_private = alloc.alloc().unwrap();
+        alloc.incref(shared).unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let layers = model.num_layers();
+        let mut older = parked_sequence(1, tx.clone());
+        older.cache = PagedCache::new(layers);
+        older.cache.assign_blocks([shared, older_private]);
+        older.cache.set_seq_len(qwen_infer::BLOCK_SIZE * 2);
+        older.prompt = vec![1u32; qwen_infer::BLOCK_SIZE * 2];
+        older.prompt_tokens = (qwen_infer::BLOCK_SIZE * 2) as u32;
+        older.tokens = vec![9];
+        older.phase = Phase::Decode(9);
+        older.admit_blocks = 3;
+        let mut victim = parked_sequence(2, tx);
+        victim.cache = PagedCache::new(layers);
+        victim.cache.assign_blocks([shared, victim_private]);
+        victim.cache.set_seq_len(qwen_infer::BLOCK_SIZE);
+        victim.prompt = older.prompt.clone();
+        victim.prompt_tokens = older.prompt_tokens;
+        victim.tokens = vec![9];
+        victim.phase = Phase::Restore { pending: 9 };
+        victim.admit_blocks = 3;
+        let mut running = vec![older, victim];
+        let mut deferred = VecDeque::new();
+        let shutdown = AtomicBool::new(false);
+        let stats = Mutex::new(EngineStats::default());
+        reserve_blocks(
+            &mut running,
+            &mut deferred,
+            &mut alloc,
+            &pool,
+            &shutdown,
+            &stats,
+        );
+        assert_eq!(stats.lock().expect("stats").last_preempted_id, 2);
+        let preempted = deferred.iter().find(|seq| seq.id == 2).expect("victim");
+        assert!(matches!(preempted.phase, Phase::Restore { pending: 9 }));
+        for mut seq in running.drain(..).chain(deferred.drain(..)) {
+            free_cache(&mut seq, &mut alloc, &pool);
+        }
+    }
+
     #[test]
     fn mixed_run_releases_every_refcount() {
         let shared_prompt = vec![1u32; qwen_infer::BLOCK_SIZE * 2];

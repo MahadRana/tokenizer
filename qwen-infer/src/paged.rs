@@ -351,7 +351,12 @@ impl BlockAllocator {
         shared
     }
 
-    /// Index every full block of `tokens`. `blocks[i]` holds tokens
+    /// Index every full block of `tokens`, including the block that holds the
+    /// last token when `tokens.len()` is a multiple of the block size.
+    ///
+    /// Lookup of this same prompt skips that last token, so this request does
+    /// not hit the block. A longer prompt that extends these tokens looks the
+    /// block up in `tokens[..len - 1]` and can hit it. `blocks[i]` holds
     /// `[i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE)`. A short tail is ignored.
     pub fn publish_prompt_blocks(&mut self, tokens: &[u32], blocks: &[BlockId]) {
         let full = tokens.len() / BLOCK_SIZE;
@@ -1168,6 +1173,27 @@ mod tests {
             alloc
                 .find_full_block(parent, Some(blocks[0]), &right[BLOCK_SIZE..BLOCK_SIZE * 2])
                 .is_none()
+        );
+    }
+
+    /// The last full block of a short prompt is not a hit for that prompt,
+    /// because lookup drops the last token. A longer prompt that continues
+    /// the same tokens does look it up.
+    #[test]
+    fn longer_extension_hits_the_shorter_prompts_last_full_block() {
+        let short = vec![4u32; BLOCK_SIZE * 2];
+        let mut long = short.clone();
+        long.extend(std::iter::repeat_n(7u32, BLOCK_SIZE));
+        let mut alloc = BlockAllocator::new(8);
+        let first = alloc.alloc_n(2).unwrap();
+        alloc.publish_prompt_blocks(&short, &first);
+        let same = alloc.take_shared_prefix(&short[..short.len() - 1]);
+        assert_eq!(same, vec![first[0]], "the short prompt shares only block 0");
+        let extended = alloc.take_shared_prefix(&long[..long.len() - 1]);
+        assert_eq!(
+            extended,
+            vec![first[0], first[1]],
+            "the extension shares the short prompt's last full block"
         );
     }
 

@@ -38,7 +38,9 @@ pub struct ServerConfig {
     /// 4096 tokens of cache.
     pub num_blocks: usize,
     /// Reuse full prompt blocks when a later request has the same prefix.
-    /// The partial last block stays private.
+    /// Lookup skips the last token, so the block that contains it is private
+    /// for this request. A longer prompt that extends these tokens can still
+    /// hit that block, which is why it is published.
     pub prefix_cache: bool,
 }
 
