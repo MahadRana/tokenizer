@@ -408,7 +408,9 @@ impl PagedCache {
         self.block_table.extend(blocks);
     }
 
-    pub(crate) fn set_seq_len(&mut self, len: usize) {
+    /// How many tokens are already stored. Sharing sets this to the matched
+    /// prefix so the next forward starts at the suffix.
+    pub fn set_seq_len(&mut self, len: usize) {
         debug_assert!(
             len == 0 || blocks_for_len(len) <= self.block_table.len(),
             "seq_len {len} does not fit in {} blocks",

@@ -27,8 +27,8 @@
 use crate::TokenCodec;
 use crate::error::ApiError;
 use qwen_infer::{
-    BLOCK_SIZE, BlockAllocator, Control, GenerateParams, PagedCache, PagedKvPool, SampleCursor,
-    SampleNext, StopReason, blocks_for_len,
+    BLOCK_SIZE, BlockAllocator, Control, GenerateParams, PagedCache, PagedKvPool, Release,
+    SampleCursor, SampleNext, StopReason, blocks_for_len,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -79,6 +79,8 @@ pub struct EngineStats {
     pub preemptions: u64,
     /// Id of the sequence most recently preempted. Zero when none has been.
     pub last_preempted_id: u64,
+    /// Most blocks that had a positive refcount at once.
+    pub peak_blocks: u64,
 }
 
 pub struct GenRequest {
@@ -231,6 +233,7 @@ pub fn engine_thread(
     inflight: Arc<AtomicUsize>,
     max_batch_size: usize,
     pool: PagedKvPool,
+    prefix_cache: bool,
 ) {
     let mut waiting: VecDeque<Sequence> = VecDeque::new();
     let mut running: Vec<Sequence> = Vec::new();
@@ -280,7 +283,9 @@ pub fn engine_thread(
             &mut waiting,
             &mut running,
             &mut alloc,
+            &pool,
             max_batch_size,
+            prefix_cache,
             &shutdown,
             &stats,
             &inflight,
@@ -351,9 +356,15 @@ pub fn engine_thread(
                 &pool,
                 codec.as_ref(),
                 &mut running,
+                &mut alloc,
+                prefix_cache,
                 &shutdown,
                 &stats,
             );
+        }
+        {
+            let mut guard = stats.lock().expect("engine stats");
+            guard.peak_blocks = guard.peak_blocks.max(alloc.peak_live() as u64);
         }
         evict_finished(&mut running, &mut alloc, &pool, &inflight, &stats);
         // Oldest preempted sequence is admitted first, ahead of requests that
@@ -377,6 +388,12 @@ pub fn engine_thread(
     for seq in leftover {
         abandon(seq, &mut alloc, &pool, &inflight, &stats);
     }
+    eprintln!("prefix peak_live {}", alloc.peak_live());
+    assert!(
+        alloc.all_refcounts_zero(),
+        "kv refcounts still held after the engine stopped"
+    );
+    alloc.reclaim_cached();
     assert_eq!(
         alloc.free_count(),
         alloc.capacity(),
@@ -438,11 +455,14 @@ fn accept(
 
 /// Admit from `waiting` while the batch has a slot and the free stack covers
 /// `admit_blocks`. A prompt that cannot fit even in an empty pool is failed.
+#[allow(clippy::too_many_arguments)]
 fn admit(
     waiting: &mut VecDeque<Sequence>,
     running: &mut Vec<Sequence>,
     alloc: &mut BlockAllocator,
+    pool: &PagedKvPool,
     max_batch_size: usize,
+    prefix_cache: bool,
     shutdown: &AtomicBool,
     stats: &Mutex<EngineStats>,
     inflight: &AtomicUsize,
@@ -466,15 +486,26 @@ fn admit(
             }
             continue;
         }
-        if alloc.free_count() < needed {
+        let prompt = waiting.front().expect("front").prompt.clone();
+        let shared = if prefix_cache {
+            alloc.take_shared_prefix(&prompt)
+        } else {
+            Vec::new()
+        };
+        let fresh = needed - shared.len();
+        if alloc.available() < fresh {
+            release_ids(&shared, alloc, pool);
             break;
         }
         let mut seq = waiting.pop_front().expect("front");
-        let ids = alloc
-            .alloc_n(seq.admit_blocks)
-            .expect("free_count was checked");
+        let mut ids = shared;
+        if fresh > 0 {
+            ids.extend(alloc.alloc_n(fresh).expect("available was checked"));
+        }
         debug_assert_eq!(seq.cache.block_count(), 0);
+        let shared_tokens = (ids.len() - fresh) * BLOCK_SIZE;
         seq.cache.assign_blocks(ids);
+        seq.cache.set_seq_len(shared_tokens);
         running.push(seq);
     }
 }
@@ -529,10 +560,10 @@ fn grow_runnable(running: &mut [Sequence], alloc: &mut BlockAllocator) -> Option
             continue;
         }
         let extra = need - have;
-        if alloc.free_count() < extra {
+        if alloc.available() < extra {
             return Some(index);
         }
-        let ids = alloc.alloc_n(extra).expect("free_count was checked");
+        let ids = alloc.alloc_n(extra).expect("available was checked");
         running[index].cache.assign_blocks(ids);
     }
     None
@@ -639,18 +670,28 @@ fn debug_assert_cache(seq: &Sequence) {
     }
 }
 
-fn free_cache(seq: &mut Sequence, alloc: &mut BlockAllocator, pool: &PagedKvPool) {
-    for id in seq.cache.take_blocks() {
-        if let Err(err) = pool.clear_block(id) {
-            eprintln!("engine id {} clear {id}: {err}", seq.id);
-        }
-        if let Err(err) = alloc.free_block(id) {
-            eprintln!("engine id {} {err}", seq.id);
-            if cfg!(debug_assertions) {
-                panic!("engine id {} {err}", seq.id);
+fn release_ids(ids: &[qwen_infer::BlockId], alloc: &mut BlockAllocator, pool: &PagedKvPool) {
+    for id in ids {
+        match alloc.free_block(*id) {
+            Ok(Release::Freed) => {
+                if let Err(err) = pool.clear_block(*id) {
+                    eprintln!("clear {id}: {err}");
+                }
+            }
+            Ok(Release::Shared | Release::Cached) => {}
+            Err(err) => {
+                eprintln!("{err}");
+                if cfg!(debug_assertions) {
+                    panic!("{err}");
+                }
             }
         }
     }
+}
+
+fn free_cache(seq: &mut Sequence, alloc: &mut BlockAllocator, pool: &PagedKvPool) {
+    let ids = seq.cache.take_blocks();
+    release_ids(&ids, alloc, pool);
 }
 
 /// Prefill new sequences, restore preempted ones, then decode the rest.
@@ -658,11 +699,14 @@ fn free_cache(seq: &mut Sequence, alloc: &mut BlockAllocator, pool: &PagedKvPool
 /// Prefill is still one prompt at a time. A restore writes the prefix back
 /// and does not sample. The prompt ids stay on the sequence: a preemption
 /// has to recompute them, so [`std::mem::take`] would throw them away.
+#[allow(clippy::too_many_arguments)]
 fn step_batch(
     model: &qwen_infer::QwenModel,
     pool: &PagedKvPool,
     codec: &dyn TokenCodec,
     running: &mut Vec<Sequence>,
+    alloc: &mut BlockAllocator,
+    prefix_cache: bool,
     shutdown: &AtomicBool,
     stats: &Mutex<EngineStats>,
 ) {
@@ -682,10 +726,19 @@ fn step_batch(
         }
     }
     for seq in &mut prefilling {
-        prefill_one(model, pool, codec, seq, shutdown, stats);
+        prefill_one(
+            model,
+            pool,
+            codec,
+            alloc,
+            prefix_cache,
+            seq,
+            shutdown,
+            stats,
+        );
     }
     for seq in &mut restoring {
-        restore_one(model, pool, seq, shutdown, stats);
+        restore_one(model, pool, alloc, prefix_cache, seq, shutdown, stats);
     }
     if !decoding.is_empty() {
         decode_group(model, pool, codec, &mut decoding, shutdown, stats);
@@ -696,29 +749,57 @@ fn step_batch(
     running.extend(prefilling);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prefill_one(
     model: &qwen_infer::QwenModel,
     pool: &PagedKvPool,
     codec: &dyn TokenCodec,
+    alloc: &mut BlockAllocator,
+    prefix_cache: bool,
     seq: &mut Sequence,
     shutdown: &AtomicBool,
     stats: &Mutex<EngineStats>,
 ) {
     let started = Instant::now();
-    let forwarded = model.forward_paged(&seq.prompt, 0, &mut seq.cache, pool);
+    let forwarded = forward_remaining(model, &seq.prompt, &mut seq.cache, pool);
     seq.prefill = started.elapsed();
     match forwarded {
-        Ok(logits) => match logits.to_vec1::<f32>() {
-            Ok(row) => push_sample(seq, &row, codec, shutdown, stats),
-            Err(err) => fail_sequence(seq, &err, shutdown, stats),
-        },
+        Ok(row) => {
+            if prefix_cache {
+                alloc.publish_prompt_blocks(&seq.prompt, seq.cache.block_table());
+            }
+            push_sample(seq, &row, codec, shutdown, stats);
+        }
         Err(err) => fail_sequence(seq, &err, shutdown, stats),
     }
+}
+
+/// Prefill `ids[cache.seq_len()..]`. A prefix hit leaves `seq_len` on a block
+/// boundary. When that is the whole prompt, the last token is run again so
+/// there is a logit row. That write is the same token into a block that
+/// already holds it.
+fn forward_remaining(
+    model: &qwen_infer::QwenModel,
+    ids: &[u32],
+    cache: &mut PagedCache,
+    pool: &PagedKvPool,
+) -> std::result::Result<Vec<f32>, String> {
+    let mut pos = cache.seq_len();
+    if pos == ids.len() && pos > 0 {
+        pos -= 1;
+        cache.set_seq_len(pos);
+    }
+    let logits = model
+        .forward_paged(&ids[pos..], pos, cache, pool)
+        .map_err(|err| err.to_string())?;
+    logits.to_vec1::<f32>().map_err(|err| err.to_string())
 }
 
 fn restore_one(
     model: &qwen_infer::QwenModel,
     pool: &PagedKvPool,
+    alloc: &mut BlockAllocator,
+    prefix_cache: bool,
     seq: &mut Sequence,
     shutdown: &AtomicBool,
     stats: &Mutex<EngineStats>,
@@ -735,10 +816,15 @@ fn restore_one(
     context.extend_from_slice(&seq.prompt);
     context.extend_from_slice(&seq.tokens[..written]);
     let started = Instant::now();
-    let forwarded = model.forward_paged(&context, 0, &mut seq.cache, pool);
+    let forwarded = forward_remaining(model, &context, &mut seq.cache, pool);
     seq.prefill += started.elapsed();
     match forwarded {
-        Ok(_) => seq.phase = Phase::Decode(pending),
+        Ok(_) => {
+            if prefix_cache {
+                alloc.publish_prompt_blocks(&seq.prompt, seq.cache.block_table());
+            }
+            seq.phase = Phase::Decode(pending);
+        }
         Err(err) => fail_sequence(seq, &err, shutdown, stats),
     }
 }
@@ -1224,6 +1310,7 @@ mod tests {
                         inflight,
                         8,
                         pool,
+                        true,
                     );
                 }
             })
@@ -1315,7 +1402,7 @@ mod tests {
                 let inflight = Arc::clone(&inflight);
                 move || {
                     let (model, pool) = tiny_pool(64);
-                    engine_thread(rx, model, codec, shutdown, stats, inflight, 4, pool);
+                    engine_thread(rx, model, codec, shutdown, stats, inflight, 4, pool, true);
                 }
             })
             .expect("spawn");
@@ -1427,6 +1514,7 @@ mod tests {
                         inflight,
                         4,
                         pool,
+                        true,
                     );
                 }
             })
@@ -1536,6 +1624,7 @@ mod tests {
                         inflight,
                         4,
                         pool,
+                        true,
                     );
                 }
             })
@@ -1712,6 +1801,7 @@ mod tests {
                         inflight,
                         2,
                         pool,
+                        true,
                     );
                 }
             })
@@ -1787,6 +1877,7 @@ mod tests {
                         inflight,
                         2,
                         pool,
+                        true,
                     );
                 }
             })
@@ -1809,6 +1900,261 @@ mod tests {
         drop(ingress);
         handle.join().expect("engine thread panicked");
         assert_eq!(inflight.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn two_copies_of_one_prompt_share_blocks_and_match_solo() {
+        let prompt = vec![1u32; qwen_infer::BLOCK_SIZE * 2];
+        let max_tokens = 2usize;
+        let (model, pool) = tiny_pool(8);
+        let mut alloc = BlockAllocator::new(8);
+        let shutdown = AtomicBool::new(false);
+        let stats = Mutex::new(EngineStats::default());
+        let inflight = AtomicUsize::new(0);
+        let (req_a, mut rx_a) = open_request(prompt.clone(), max_tokens, false);
+        let (req_b, mut rx_b) = open_request(prompt.clone(), max_tokens, false);
+        let mut next_id = 1u64;
+        let mut waiting = VecDeque::new();
+        let mut running = Vec::new();
+        waiting.push_back(
+            accept(
+                req_a,
+                &mut next_id,
+                model.num_layers(),
+                &inflight,
+                &shutdown,
+                &stats,
+            )
+            .expect("a"),
+        );
+        admit(
+            &mut waiting,
+            &mut running,
+            &mut alloc,
+            &pool,
+            2,
+            true,
+            &shutdown,
+            &stats,
+            &inflight,
+        );
+        step_batch(
+            &model,
+            &pool,
+            &UnitCodec,
+            &mut running,
+            &mut alloc,
+            true,
+            &shutdown,
+            &stats,
+        );
+        waiting.push_back(
+            accept(
+                req_b,
+                &mut next_id,
+                model.num_layers(),
+                &inflight,
+                &shutdown,
+                &stats,
+            )
+            .expect("b"),
+        );
+        admit(
+            &mut waiting,
+            &mut running,
+            &mut alloc,
+            &pool,
+            2,
+            true,
+            &shutdown,
+            &stats,
+            &inflight,
+        );
+        let private = blocks_for_len(prompt.len()) * 2;
+        assert!(
+            alloc.live_count() < private,
+            "live {} is not under two private prefixes ({private})",
+            alloc.live_count()
+        );
+        let mut done_a = None;
+        let mut done_b = None;
+        let mut guard = 0;
+        while done_a.is_none() || done_b.is_none() {
+            guard += 1;
+            assert!(guard < 40, "copies did not finish");
+            let mut deferred = VecDeque::new();
+            reserve_blocks(
+                &mut running,
+                &mut deferred,
+                &mut alloc,
+                &pool,
+                &shutdown,
+                &stats,
+            );
+            if running.iter().any(can_forward) {
+                step_batch(
+                    &model,
+                    &pool,
+                    &UnitCodec,
+                    &mut running,
+                    &mut alloc,
+                    true,
+                    &shutdown,
+                    &stats,
+                );
+            }
+            evict_finished(&mut running, &mut alloc, &pool, &inflight, &stats);
+            for seq in deferred.drain(..) {
+                waiting.push_front(seq);
+            }
+            collect_done(&mut rx_a, &mut done_a);
+            collect_done(&mut rx_b, &mut done_b);
+        }
+        let solo = qwen_infer::tiny_model(false);
+        let alone = qwen_infer::generate(
+            &solo,
+            &prompt,
+            &GenerateParams::greedy(max_tokens),
+            unit_bytes,
+        )
+        .unwrap();
+        assert_eq!(done_a.expect("a").tokens, alone.tokens);
+        assert_eq!(done_b.expect("b").tokens, alone.tokens);
+        assert!(alloc.peak_live() < private + 2);
+    }
+
+    #[test]
+    fn preempting_one_sharer_keeps_the_other_output() {
+        let prompt = vec![1u32; qwen_infer::BLOCK_SIZE];
+        let max_tokens = 4usize;
+        let (model, pool) = tiny_pool(2);
+        let mut alloc = BlockAllocator::new(2);
+        let shutdown = AtomicBool::new(false);
+        let stats = Mutex::new(EngineStats::default());
+        let inflight = AtomicUsize::new(0);
+        let (req_a, mut rx_a) = open_request(prompt.clone(), max_tokens, false);
+        let (req_b, mut rx_b) = open_request(prompt.clone(), max_tokens, false);
+        let mut next_id = 1u64;
+        let mut waiting = VecDeque::new();
+        let mut running = Vec::new();
+        waiting.push_back(
+            accept(
+                req_a,
+                &mut next_id,
+                model.num_layers(),
+                &inflight,
+                &shutdown,
+                &stats,
+            )
+            .expect("a"),
+        );
+        admit(
+            &mut waiting,
+            &mut running,
+            &mut alloc,
+            &pool,
+            2,
+            true,
+            &shutdown,
+            &stats,
+            &inflight,
+        );
+        assert_eq!(running.len(), 1);
+        step_batch(
+            &model,
+            &pool,
+            &UnitCodec,
+            &mut running,
+            &mut alloc,
+            true,
+            &shutdown,
+            &stats,
+        );
+        waiting.push_back(
+            accept(
+                req_b,
+                &mut next_id,
+                model.num_layers(),
+                &inflight,
+                &shutdown,
+                &stats,
+            )
+            .expect("b"),
+        );
+        let mut done_a = None;
+        let mut done_b = None;
+        let mut guard = 0;
+        while done_a.is_none() || done_b.is_none() {
+            guard += 1;
+            assert!(guard < 40, "sharers did not finish");
+            admit(
+                &mut waiting,
+                &mut running,
+                &mut alloc,
+                &pool,
+                2,
+                true,
+                &shutdown,
+                &stats,
+                &inflight,
+            );
+            let mut deferred = VecDeque::new();
+            reserve_blocks(
+                &mut running,
+                &mut deferred,
+                &mut alloc,
+                &pool,
+                &shutdown,
+                &stats,
+            );
+            if running.iter().any(can_forward) {
+                step_batch(
+                    &model,
+                    &pool,
+                    &UnitCodec,
+                    &mut running,
+                    &mut alloc,
+                    true,
+                    &shutdown,
+                    &stats,
+                );
+            }
+            evict_finished(&mut running, &mut alloc, &pool, &inflight, &stats);
+            for seq in deferred.drain(..) {
+                waiting.push_front(seq);
+            }
+            collect_done(&mut rx_a, &mut done_a);
+            collect_done(&mut rx_b, &mut done_b);
+        }
+        let done_a = done_a.expect("a");
+        let done_b = done_b.expect("b");
+        assert!(stats.lock().expect("stats").preemptions >= 1);
+        let solo = qwen_infer::tiny_model(false);
+        let alone = qwen_infer::generate(
+            &solo,
+            &prompt,
+            &GenerateParams::greedy(max_tokens),
+            unit_bytes,
+        )
+        .unwrap();
+        assert_eq!(done_a.tokens, alone.tokens);
+        assert_eq!(done_b.tokens, alone.tokens);
+        for mut seq in waiting.drain(..).chain(running.drain(..)) {
+            free_cache(&mut seq, &mut alloc, &pool);
+        }
+        assert!(alloc.all_refcounts_zero());
+    }
+
+    fn collect_done(rx: &mut mpsc::Receiver<GenUpdate>, slot: &mut Option<Done>) {
+        loop {
+            match rx.try_recv() {
+                Ok(GenUpdate::Done(value)) => *slot = Some(value),
+                Ok(GenUpdate::Delta(_)) => {}
+                Ok(GenUpdate::Failed(message)) => panic!("engine failed: {message}"),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
     }
 
     fn wait_update(rx: &mut mpsc::Receiver<GenUpdate>) -> GenUpdate {
