@@ -62,5 +62,5 @@ jobs:
         key: cargo-infer-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           cargo-infer-${{ runner.os }}-
-    - name: Test qwen-infer and qwen-server
-      run: cargo test -p qwen-infer && cargo test -p qwen-server
+    - name: Test qwen-infer, qwen-server, and loadgen
+      run: cargo test -p qwen-infer && cargo test -p qwen-server && cargo test -p loadgen

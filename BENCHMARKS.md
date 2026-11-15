@@ -229,3 +229,93 @@ Measured 2026-11-10, branch `feat/b5-paged-kv-cache`, rustc 1.99.1 (58cf8f9c3 20
 - Linux 6.12.113+ x86_64, KVM guest
 - 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores.
 - MemTotal 16,387,328 kB
+
+## B6: open-loop offered load, 50 requests per cell
+
+Not a steady-state run. Each cell is **one** sample: 1 warmup request (dropped) and **50** measured requests, seed 1, temperature 0. Every cell returned 50 ok, 0 errors, 1600 output tokens (32 per request). Output tokens/s is 1600 divided by the client wall clock, and that clock includes the Poisson gaps, so a low offered load is partly idle time. There is no closed-loop concurrency mode. The column is offered load, the Poisson `--rate` in requests/s. It is not a concurrency cap.
+
+TTFT is the client clock from send to the first SSE `data:` line that has `delta.content`. The server writes a role `data:` line as soon as the stream is polled, before prefill returns. That line is not the first token. The client timeout is 900 s. The histogram records up to 30 minutes.
+
+B2 has no HTTP server. "No batching" is the B5 `qwen-server` binary with `--max-batch-size 1`. The KV pool is still the B5 paged pool. It is not the original in-process `generate` loop. The B4 rows are a separate binary: the contiguous engine at main `3378a6b940ec1fef938962e5ec684df42ee5f3f8`, built in a detached worktree. That commit's CLI has no `--num-blocks`. The 2026-11-08 B4 row above (one request 5.64 tok/s, eight concurrent 34.38 tok/s, 16 tokens, a closed burst) is a different experiment and is not copied into this table.
+
+The batch cap is fixed for the sweep. No-batching stays at 1. B4 and B5 stay at 8, the server default. `--max-waiting` is 64 so the 50 requests can sit in the queue instead of taking HTTP 429. B5 and no-batching also pass `--num-blocks 256`.
+
+### Workload
+
+`--workload mix`, seed 1. Two `StdRng` streams are both seeded with that integer and do not share draws. One draws the exponential gaps. The other draws `random_range(0..4)` once per measured request. The warmup is always the first catalog entry and is not part of that draw.
+
+The user string is `"amber ".repeat(n)`, trailing space included. The server wraps it in the Qwen2.5 chat template: the default system line `You are Qwen, created by Alibaba Cloud. You are a helpful assistant.`, then the user string, then `<|im_start|>assistant\n`. `RankTokenizer::load_qwen` `encode` (every special token allowed) of that full string is the prompt length:
+
+| repeats of `"amber "` | full prompt tokens | max_tokens |
+|---|---|---|
+| 2 | 32 | 32 |
+| 34 | 64 | 32 |
+| 66 | 96 | 32 |
+| 98 | 128 | 32 |
+
+Seed 1 over 50 requests assigned those four lengths **13, 14, 9, and 14** times. The first eight indexes are 3, 3, 3, 2, 0, 1, 0, 0. Every measured request produced 32 content events, so none of them stopped on EOS before `max_tokens`.
+
+One request each, same machine, paged server, `--max-batch-size 1`, not a matrix cell: prompt 32/64/96/128 tokens had client TTFT 0.243/0.308/0.401/0.468 s and end-to-end 6.083/6.205/6.319/6.324 s. Decode was about 5.8–5.9 s. A weighted mean of those four TTFTs with the seed-1 counts is 0.35 s. That is the unloaded reference for the table below.
+
+### Commands
+
+Paged server and loadgen are the release build of `feat/b6-benchmarks` at `f410b6a73086778f3d589d1c99a2377d0020c743`.
+
+```
+cargo build --release -p qwen-server -p loadgen
+target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size <1 or 8> --max-waiting 64 --num-blocks 256
+target/release/loadgen --url http://127.0.0.1:18080/v1/chat/completions --requests 50 --rate <offered> --seed 1 --warmup 1 --workload mix
+```
+
+Contiguous B4 server. The current branch was not moved. `CARGO_TARGET_DIR` keeps that build out of this tree's `target/`. The build was run again for this round; the worktree was already at that commit and cargo reused the release binary.
+
+```
+git worktree add --detach /tmp/b4-wt 3378a6b940ec1fef938962e5ec684df42ee5f3f8
+cd /tmp/b4-wt && CARGO_TARGET_DIR=/tmp/b4-target cargo build --release -p qwen-server
+/tmp/b4-target/release/qwen-server --bind 127.0.0.1:18080 --max-batch-size 8 --max-waiting 64
+```
+
+Model: Qwen/Qwen2.5-0.5B-Instruct, f32, `Device::Cpu`. Measured 2026-11-10, rustc 1.99.1 (58cf8f9c3 2026-10-13).
+
+- Linux 6.12.113+ x86_64, KVM guest
+- 4 vCPUs, Intel Xeon (family 6, model 207; `lscpu` reports "Intel(R) Xeon(R) Processor"). One thread per core, four cores, one socket.
+- MemTotal 16,387,328 kB
+
+The 0.06 cells take about 14 minutes each because the arrivals themselves span `(50-1)/0.06` seconds. The first six cells used 3505 s. The four cells at 0.5 and 1.0 req/s are B4 and B5 only, same mix, seed, and batch cap, and finished in 375 s. 2.0 req/s was not run: 1.0 already saturates both of those modes. The batch-size-1 proxy has no row above 0.25 req/s, because that point is already saturated. 100 requests was not run.
+
+| mode | offered load | max batch | n | output tok/s | req/s | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 | e2e p99 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| no batching | 0.06 req/s | 1 | 50 | 1.8782 | 0.0587 | 0.539 s | 14.819 s | 0.198 s | 0.248 s | 20.972 s |
+| no batching | 0.25 req/s | 1 | 50 | 5.0282 | 0.1571 | 68.092 s | 110.952 s | 0.190 s | 0.222 s | 116.851 s |
+| B4 contiguous | 0.06 req/s | 8 | 50 | 1.8960 | 0.0593 | 0.393 s | 0.733 s | 0.192 s | 0.328 s | 7.193 s |
+| B4 contiguous | 0.25 req/s | 8 | 50 | 7.7556 | 0.2424 | 0.464 s | 1.083 s | 0.132 s | 0.664 s | 7.356 s |
+| B4 contiguous | 0.5 req/s | 8 | 50 | 15.1531 | 0.4735 | 0.579 s | 4.135 s | 0.144 s | 0.785 s | 12.149 s |
+| B4 contiguous | 1.0 req/s | 8 | 50 | 26.0757 | 0.8149 | 5.026 s | 9.781 s | 0.191 s | 0.903 s | 18.285 s |
+| B5 paged | 0.06 req/s | 8 | 50 | 1.8962 | 0.0593 | 0.392 s | 1.594 s | 0.189 s | 0.316 s | 7.713 s |
+| B5 paged | 0.25 req/s | 8 | 50 | 7.7725 | 0.2429 | 0.476 s | 1.223 s | 0.123 s | 0.730 s | 8.610 s |
+| B5 paged | 0.5 req/s | 8 | 50 | 15.1789 | 0.4743 | 0.504 s | 2.738 s | 0.132 s | 0.708 s | 9.978 s |
+| B5 paged | 1.0 req/s | 8 | 50 | 24.0145 | 0.7505 | 7.950 s | 12.255 s | 0.206 s | 1.148 s | 21.365 s |
+
+Saturation here means the achieved request rate falls behind the offer, or TTFT p50 jumps. No batching does that at **0.25 req/s**: achieved 0.1571 against 0.25, and TTFT p50 goes from 0.539 s to 68.092 s. At 0.06 req/s it was still keeping up (0.0587 against 0.06). B4 and B5 do not do that at 0.5 req/s. Achieved rates are 0.4735 and 0.4743 against 0.5, TTFT p50 stays at 0.579 s and 0.504 s, and output rate is still climbing (7.76 to 15.15 tok/s for B4, 7.77 to 15.18 for B5). Both saturate at **1.0 req/s**. B4 achieves 0.8149 against 1.0 and TTFT p50 jumps to 5.026 s. B5 achieves 0.7505 against 1.0 and TTFT p50 jumps to 7.950 s. Nothing between 0.5 and 1.0 was measured, so the point named above is the first measured offer where that happened, not a fitted knee.
+
+The tok/s gap at 0.06 (1.88 vs 1.90) is the idle time, not the engine. CSV: `bench/results/b6-ttft-curve.csv`. Each `#` is about 1 s of p99 TTFT. The saturated no-batching cell and the 1.0 req/s p99s are past a 16 s scale, so those p99s are written as numbers.
+
+```
+offered 0.06 req/s
+no-batch  1.88 tok/s  ###############  14.8 s
+B4        1.90 tok/s  #                  0.7 s
+B5        1.90 tok/s  ##                 1.6 s
+
+offered 0.25 req/s
+no-batch  5.03 tok/s  p99 TTFT 111.0 s
+B4        7.76 tok/s  #                  1.1 s
+B5        7.77 tok/s  #                  1.2 s
+
+offered 0.5 req/s
+B4       15.15 tok/s  ####               4.1 s
+B5       15.18 tok/s  ###                2.7 s
+
+offered 1.0 req/s
+B4       26.08 tok/s  p99 TTFT 9.8 s   p50 TTFT 5.0 s
+B5       24.01 tok/s  p99 TTFT 12.3 s  p50 TTFT 8.0 s
+```
