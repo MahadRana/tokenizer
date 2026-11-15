@@ -12,6 +12,7 @@
 //! several of those caches in one matmul. Prefill stays on `forward`: prompts
 //! have different lengths, and packing them is a separate problem.
 
+use crate::paged::{BLOCK_SIZE, PagedCache, PagedKvPool, blocks_for_len};
 use crate::sample::greedy_token;
 
 use candle_core::{DType, Device, Result, Tensor, bail};
@@ -390,6 +391,132 @@ impl Attention {
             .reshape((batch, seq, self.num_heads * self.head_dim))?
             .apply(&self.o_proj)
     }
+
+    /// One chunk whose K and V live in `pool`, addressed by `cache`'s block table.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_paged(
+        &self,
+        xs: &Tensor,
+        mask: &Tensor,
+        rope: &RotaryEmbedding,
+        pos: usize,
+        cache: &PagedCache,
+        pool: &PagedKvPool,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (q, k, v) = self.project(xs)?;
+        let q = rope.apply(&q, pos)?;
+        let k = rope.apply(&k, pos)?;
+        pool.write_layer(layer_idx, cache.block_table(), pos, &k, &v)?;
+        let k = pool.gather_layer(layer_idx, cache.block_table(), true)?;
+        let v = pool.gather_layer(layer_idx, cache.block_table(), false)?;
+        self.attend(&q, &k, &v, mask)
+    }
+
+    /// One new token per sequence, written into that sequence's own blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_decode_paged(
+        &self,
+        xs: &Tensor,
+        mask: &Tensor,
+        rope: &RotaryEmbedding,
+        positions: &[usize],
+        caches: &[&mut PagedCache],
+        pool: &PagedKvPool,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (batch, seq, _) = xs.dims3()?;
+        if seq != 1 || batch != caches.len() || positions.len() != batch {
+            bail!(
+                "paged decode batch is (batch, 1) with one cache and one position each, got xs {:?}, {} caches, {} positions",
+                xs.shape(),
+                caches.len(),
+                positions.len()
+            );
+        }
+        let (q, k, v) = self.project(xs)?;
+        let q = rope.apply_positions(&q, positions)?;
+        let k = rope.apply_positions(&k, positions)?;
+        for (index, cache) in caches.iter().enumerate() {
+            let k_i = k.narrow(0, index, 1)?;
+            let v_i = v.narrow(0, index, 1)?;
+            pool.write_layer(layer_idx, cache.block_table(), positions[index], &k_i, &v_i)?;
+        }
+        let mut keys = Vec::with_capacity(caches.len());
+        let mut values = Vec::with_capacity(caches.len());
+        for cache in caches {
+            keys.push(pool.gather_layer(layer_idx, cache.block_table(), true)?);
+            values.push(pool.gather_layer(layer_idx, cache.block_table(), false)?);
+        }
+        self.attend(&q, &stack_kv_batch(&keys)?, &stack_kv_batch(&values)?, mask)
+    }
+
+    /// Q, K, V in `(batch, heads, seq, head_dim)`. K and V still have `kv_heads`.
+    fn project(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let (batch, seq, _) = xs.dims3()?;
+        let q = self
+            .q_proj
+            .forward(xs)?
+            .reshape((batch, seq, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = self
+            .k_proj
+            .forward(xs)?
+            .reshape((batch, seq, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = self
+            .v_proj
+            .forward(xs)?
+            .reshape((batch, seq, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        Ok((q, k, v))
+    }
+
+    fn attend(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let (batch, _heads, seq, _) = q.dims4()?;
+        let groups = self.num_heads / self.num_kv_heads;
+        let k = repeat_kv(k, groups)?;
+        let v = repeat_kv(v, groups)?;
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let scores = q
+            .matmul(&k.transpose(2, 3)?.contiguous()?)?
+            .affine(scale, 0.0)?;
+        let scores = scores.broadcast_add(mask)?;
+        let weights = candle_nn::ops::softmax_last_dim(&scores)?;
+        let mixed = weights.matmul(&v.contiguous()?)?;
+        mixed
+            .transpose(1, 2)?
+            .reshape((batch, seq, self.num_heads * self.head_dim))?
+            .apply(&self.o_proj)
+    }
+}
+
+/// Pad `(1, heads, seq_i, dim)` on the sequence axis and stack on the batch axis.
+fn stack_kv_batch(parts: &[Tensor]) -> Result<Tensor> {
+    if parts.is_empty() {
+        bail!("no kv tensors to stack");
+    }
+    let mut max_len = 0usize;
+    for tensor in parts {
+        max_len = max_len.max(tensor.dim(2)?);
+    }
+    let mut padded = Vec::with_capacity(parts.len());
+    for tensor in parts {
+        let len = tensor.dim(2)?;
+        if len == max_len {
+            padded.push(tensor.contiguous()?);
+            continue;
+        }
+        let (batch, heads, _, dim) = tensor.dims4()?;
+        let pad = Tensor::zeros(
+            (batch, heads, max_len - len, dim),
+            tensor.dtype(),
+            tensor.device(),
+        )?;
+        padded.push(Tensor::cat(&[tensor, &pad], 2)?.contiguous()?);
+    }
+    let refs: Vec<&Tensor> = padded.iter().collect();
+    Tensor::cat(&refs, 0)
 }
 
 /// Stack per-sequence K or V along the batch axis, padding the sequence axis
@@ -515,6 +642,52 @@ impl Layer {
         let xs = self.mlp.forward(&xs)?;
         xs + residual
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_paged(
+        &self,
+        xs: &Tensor,
+        mask: &Tensor,
+        rope: &RotaryEmbedding,
+        pos: usize,
+        cache: &PagedCache,
+        pool: &PagedKvPool,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_norm.forward(xs)?;
+        let xs = self
+            .attn
+            .forward_paged(&xs, mask, rope, pos, cache, pool, layer_idx)?;
+        let xs = (xs + residual)?;
+        let residual = &xs;
+        let xs = self.post_norm.forward(&xs)?;
+        let xs = self.mlp.forward(&xs)?;
+        xs + residual
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_decode_paged(
+        &self,
+        xs: &Tensor,
+        mask: &Tensor,
+        rope: &RotaryEmbedding,
+        positions: &[usize],
+        caches: &[&mut PagedCache],
+        pool: &PagedKvPool,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_norm.forward(xs)?;
+        let xs = self
+            .attn
+            .forward_decode_paged(&xs, mask, rope, positions, caches, pool, layer_idx)?;
+        let xs = (xs + residual)?;
+        let residual = &xs;
+        let xs = self.post_norm.forward(&xs)?;
+        let xs = self.mlp.forward(&xs)?;
+        xs + residual
+    }
 }
 
 enum Head {
@@ -622,6 +795,34 @@ impl QwenModel {
     /// rejected before the engine thread sees it.
     pub fn max_position_embeddings(&self) -> usize {
         self.cfg.max_position_embeddings
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.cfg.hidden_size / self.cfg.num_attention_heads
+    }
+
+    pub fn num_kv_heads(&self) -> usize {
+        self.cfg.num_key_value_heads
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Fixed KV pool for this model. `num_blocks` is shared by every sequence.
+    pub fn kv_pool(&self, num_blocks: usize) -> Result<PagedKvPool> {
+        PagedKvPool::new(
+            num_blocks,
+            self.num_layers(),
+            self.num_kv_heads(),
+            self.head_dim(),
+            self.dtype,
+            &self.device,
+        )
     }
 
     /// Hidden states after the final RMSNorm, shape `(1, seq, hidden)`.
@@ -803,6 +1004,173 @@ impl QwenModel {
         }
         let hidden = self.norm.forward(&xs)?;
         self.logits_from_rows(&hidden)
+    }
+
+    /// [`Self::forward`] writing into a [`PagedKvPool`].
+    ///
+    /// `pos` must equal `cache.seq_len()`. The block table must already contain
+    /// [`blocks_for_len`]`(pos + ids.len())` blocks. This does not allocate.
+    /// Columns at and past the new length are masked. That covers the unused
+    /// tail of the last block.
+    pub fn forward_paged(
+        &self,
+        ids: &[u32],
+        pos: usize,
+        cache: &mut PagedCache,
+        pool: &PagedKvPool,
+    ) -> Result<Tensor> {
+        if ids.is_empty() {
+            bail!("no tokens");
+        }
+        self.check_paged(cache, pool)?;
+        if pos != cache.seq_len() {
+            bail!(
+                "pos {pos} does not match the paged cache length {}",
+                cache.seq_len()
+            );
+        }
+        self.check_pos(pos, ids.len())?;
+        let end = pos + ids.len();
+        let need = blocks_for_len(end);
+        if cache.block_count() < need {
+            bail!(
+                "paged cache has {} blocks, positions {pos}..{end} need {need}",
+                cache.block_count()
+            );
+        }
+        let input = Tensor::from_slice(ids, (1, ids.len()), &self.device)?;
+        let mut xs = self.embed.forward(&input)?;
+        let seq = ids.len();
+        let kv_len = cache.block_count() * BLOCK_SIZE;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let window = self.window_for_layer(index);
+            let mask = self.paged_mask(seq, kv_len, pos, end, window)?;
+            xs = layer.forward_paged(&xs, &mask, &self.rope, pos, cache, pool, index)?;
+        }
+        cache.set_seq_len(end);
+        let hidden = self.norm.forward(&xs)?;
+        self.logits_from_last(&hidden)
+    }
+
+    /// [`Self::forward_decode_batch`] for paged caches that share `pool`.
+    pub fn forward_decode_batch_paged(
+        &self,
+        ids: &[u32],
+        caches: &mut [&mut PagedCache],
+        pool: &PagedKvPool,
+    ) -> Result<Tensor> {
+        if ids.is_empty() || ids.len() != caches.len() {
+            bail!(
+                "paged decode batch wants one token per cache, got {} tokens and {} caches",
+                ids.len(),
+                caches.len()
+            );
+        }
+        if pool.num_layers() != self.layers.len() || pool.block_size() != BLOCK_SIZE {
+            bail!(
+                "paged pool has {} layers and block size {}, model has {} layers",
+                pool.num_layers(),
+                pool.block_size(),
+                self.layers.len()
+            );
+        }
+        let mut positions = Vec::with_capacity(ids.len());
+        for cache in caches.iter() {
+            self.check_paged(cache, pool)?;
+            let pos = cache.seq_len();
+            if pos == 0 {
+                bail!("paged decode cache is empty; prefill with forward_paged first");
+            }
+            self.check_pos(pos, 1)?;
+            let need = blocks_for_len(pos + 1);
+            if cache.block_count() < need {
+                bail!(
+                    "paged cache has {} blocks, decode at {pos} needs {need}",
+                    cache.block_count()
+                );
+            }
+            positions.push(pos);
+        }
+        let input = Tensor::from_slice(ids, (ids.len(), 1), &self.device)?;
+        let mut xs = self.embed.forward(&input)?;
+        let lengths: Vec<usize> = positions.iter().map(|pos| pos + 1).collect();
+        for (index, layer) in self.layers.iter().enumerate() {
+            let window = self.window_for_layer(index);
+            let max_kv = caches
+                .iter()
+                .map(|cache| cache.block_count() * BLOCK_SIZE)
+                .max()
+                .unwrap_or(0);
+            let mask = self.paged_decode_mask(&lengths, &positions, max_kv, window)?;
+            xs = layer
+                .forward_decode_paged(&xs, &mask, &self.rope, &positions, caches, pool, index)?;
+        }
+        for cache in caches.iter_mut() {
+            let len = cache.seq_len() + 1;
+            cache.set_seq_len(len);
+        }
+        let hidden = self.norm.forward(&xs)?;
+        self.logits_from_rows(&hidden)
+    }
+
+    fn check_paged(&self, cache: &PagedCache, pool: &PagedKvPool) -> Result<()> {
+        if cache.num_layers() != self.layers.len() || pool.num_layers() != self.layers.len() {
+            bail!(
+                "paged cache has {} layers, pool has {}, model has {}",
+                cache.num_layers(),
+                pool.num_layers(),
+                self.layers.len()
+            );
+        }
+        Ok(())
+    }
+
+    fn paged_decode_mask(
+        &self,
+        lengths: &[usize],
+        positions: &[usize],
+        kv_len: usize,
+        window: Option<usize>,
+    ) -> Result<Tensor> {
+        if kv_len == 0 || lengths.len() != positions.len() {
+            bail!("paged decode mask has no keys");
+        }
+        let mut values = Vec::with_capacity(lengths.len() * kv_len);
+        for (b, &len) in lengths.iter().enumerate() {
+            let query = positions[b];
+            for key in 0..kv_len {
+                let value = if key >= len {
+                    f32::NEG_INFINITY
+                } else {
+                    mask_value(query, key, window)
+                };
+                values.push(value);
+            }
+        }
+        Tensor::from_vec(values, (lengths.len(), 1, 1, kv_len), &self.device)?.to_dtype(self.dtype)
+    }
+
+    fn paged_mask(
+        &self,
+        q_len: usize,
+        kv_len: usize,
+        query_pos: usize,
+        valid_len: usize,
+        window: Option<usize>,
+    ) -> Result<Tensor> {
+        let mut values = Vec::with_capacity(q_len * kv_len);
+        for q in 0..q_len {
+            let query = query_pos + q;
+            for key in 0..kv_len {
+                let value = if key >= valid_len {
+                    f32::NEG_INFINITY
+                } else {
+                    mask_value(query, key, window)
+                };
+                values.push(value);
+            }
+        }
+        Tensor::from_vec(values, (1, 1, q_len, kv_len), &self.device)?.to_dtype(self.dtype)
     }
 
     /// Additive mask `(batch, 1, 1, max_kv)` for a one-token decode batch.
@@ -1360,6 +1728,153 @@ mod tests {
                 diff <= 1e-4,
                 "after drop, seq {index} diverged from solo by {diff}"
             );
+        }
+    }
+
+    /// Mixed lengths, including a prompt that ends on a block boundary and one
+    /// that ends one token past it. Paged logits match the contiguous cache.
+    /// A second chunk starts in the middle of a block.
+    #[test]
+    fn paged_equals_contiguous() {
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1],
+            vec![2, 3, 4],
+            vec![5; 15],
+            vec![6; 16],
+            vec![7; 17],
+            vec![8; 31],
+            vec![9; 32],
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+        ];
+        let steps = 4usize;
+        for sliding in [false, true] {
+            // `patterned_model` stops at position 32. A 32-token prompt plus
+            // a decode step needs the longer table `tiny_model` builds.
+            let model = tiny_model(sliding);
+            let pool = model.kv_pool(64).unwrap();
+            let mut hold = Hold {
+                alloc: crate::paged::BlockAllocator::new(64),
+                caches: Vec::new(),
+            };
+            let mut contig = Vec::new();
+            let mut rows = Vec::new();
+            let mut worst = 0.0f32;
+            for prompt in &prompts {
+                let mut paged = PagedCache::new(model.num_layers());
+                paged.assign_blocks(hold.alloc.alloc_n(blocks_for_len(prompt.len())).unwrap());
+                let mut plain = KvCache::new(model.num_layers());
+                let paged_row = model
+                    .forward_paged(prompt, 0, &mut paged, &pool)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let plain_row = model
+                    .forward(prompt, 0, &mut plain)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let diff = max_abs(&paged_row, &plain_row);
+                assert!(
+                    diff <= 1e-4,
+                    "prefill len {} sliding {sliding} max abs {diff}",
+                    prompt.len()
+                );
+                worst = worst.max(diff);
+                hold.caches.push(paged);
+                contig.push(plain);
+                rows.push(plain_row);
+            }
+            for step in 0..steps - 1 {
+                let next: Vec<u32> = rows
+                    .iter()
+                    .map(|row| crate::greedy_token(row).unwrap())
+                    .collect();
+                for cache in hold.caches.iter_mut() {
+                    let need = blocks_for_len(cache.seq_len() + 1);
+                    if cache.block_count() < need {
+                        let extra = hold.alloc.alloc_n(need - cache.block_count()).unwrap();
+                        cache.assign_blocks(extra);
+                    }
+                }
+                let mut refs: Vec<&mut PagedCache> = hold.caches.iter_mut().collect();
+                let paged_rows = model
+                    .forward_decode_batch_paged(&next, &mut refs, &pool)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap();
+                drop(refs);
+                let mut plain_refs: Vec<&mut KvCache> = contig.iter_mut().collect();
+                let plain_rows = model
+                    .forward_decode_batch(&next, &mut plain_refs)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap();
+                for index in 0..prompts.len() {
+                    let diff = max_abs(&paged_rows[index], &plain_rows[index]);
+                    assert!(
+                        diff <= 1e-4,
+                        "sliding {sliding} decode step {step} seq {index} len {} max abs {diff}",
+                        prompts[index].len()
+                    );
+                    worst = worst.max(diff);
+                    rows[index] = plain_rows[index].clone();
+                }
+            }
+
+            // Token 10 is the middle of a 16-token block. The second forward
+            // continues that block and spills into the next one.
+            let prompt: Vec<u32> = (1..21).collect();
+            let mut paged = PagedCache::new(model.num_layers());
+            paged.assign_blocks(hold.alloc.alloc_n(blocks_for_len(prompt.len())).unwrap());
+            let mut plain = KvCache::new(model.num_layers());
+            model
+                .forward_paged(&prompt[..10], 0, &mut paged, &pool)
+                .unwrap();
+            model.forward(&prompt[..10], 0, &mut plain).unwrap();
+            let paged_row = model
+                .forward_paged(&prompt[10..], 10, &mut paged, &pool)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let plain_row = model
+                .forward(&prompt[10..], 10, &mut plain)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let full = model
+                .last_logits(&prompt)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let diff = max_abs(&paged_row, &plain_row);
+            let diff_full = max_abs(&paged_row, &full);
+            assert!(
+                diff <= 1e-4,
+                "chunked paged vs contiguous sliding {sliding} max abs {diff}"
+            );
+            assert!(
+                diff_full <= 1e-4,
+                "chunked paged vs full sliding {sliding} max abs {diff_full}"
+            );
+            worst = worst.max(diff).max(diff_full);
+            hold.caches.push(paged);
+            eprintln!("paged_equals_contiguous sliding={sliding} max abs {worst}");
+        }
+    }
+
+    /// Returns blocks before the caches drop, including when an assertion panics.
+    struct Hold {
+        alloc: crate::paged::BlockAllocator,
+        caches: Vec<PagedCache>,
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            for cache in &mut self.caches {
+                for id in cache.take_blocks() {
+                    self.alloc.free_block(id).expect("free block");
+                }
+            }
         }
     }
 }

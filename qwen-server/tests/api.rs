@@ -436,6 +436,7 @@ async fn short_request_joins_a_running_batch() {
         ServerConfig {
             max_batch_size: 4,
             max_waiting: 4,
+            ..ServerConfig::default()
         },
     )
     .await;
@@ -524,6 +525,7 @@ async fn over_capacity_returns_429() {
         ServerConfig {
             max_batch_size: 1,
             max_waiting: 0,
+            ..ServerConfig::default()
         },
     )
     .await;
@@ -553,6 +555,7 @@ async fn over_capacity_returns_429() {
         ServerConfig {
             max_batch_size: 1,
             max_waiting: 1,
+            ..ServerConfig::default()
         },
     )
     .await;
