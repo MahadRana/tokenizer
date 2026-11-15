@@ -23,8 +23,11 @@ async fn main() -> anyhow::Result<()> {
     let eos = qwen_infer::load_eos_token_ids(&files.generation_config)?;
     let model = qwen_infer::load_model(&files.config, &files.weights)?;
     eprintln!(
-        "eos ids {eos:?}  max_batch_size {}  max_waiting {}  num_blocks {}",
-        options.config.max_batch_size, options.config.max_waiting, options.config.num_blocks
+        "eos ids {eos:?}  max_batch_size {}  max_waiting {}  num_blocks {}  prefix_cache {}",
+        options.config.max_batch_size,
+        options.config.max_waiting,
+        options.config.num_blocks,
+        options.config.prefix_cache
     );
     let server = qwen_server::serve_with(
         model,
@@ -41,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
     );
     tokio::signal::ctrl_c().await?;
     eprintln!("shutting down");
-    server.shutdown().await;
+    let stats = server.shutdown().await;
+    eprintln!(
+        "prefix peak_live {} peak_occupied {}",
+        stats.peak_blocks, stats.peak_occupied
+    );
     Ok(())
 }
 
@@ -58,7 +65,7 @@ fn parse_args() -> Options {
         match arg.as_str() {
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: qwen-server [--bind 127.0.0.1:8080] [--max-batch-size 8] [--max-waiting 32] [--num-blocks 256]"
+                    "usage: qwen-server [--bind 127.0.0.1:8080] [--max-batch-size 8] [--max-waiting 32] [--num-blocks 256] [--no-prefix-cache]"
                 );
                 std::process::exit(0);
             }
@@ -76,6 +83,9 @@ fn parse_args() -> Options {
             }
             "--num-blocks" => {
                 config.num_blocks = parse_usize("--num-blocks", &mut args);
+            }
+            "--no-prefix-cache" => {
+                config.prefix_cache = false;
             }
             other => {
                 eprintln!("unknown argument {other}");
